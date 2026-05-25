@@ -425,10 +425,71 @@ static bool PreloadJvm(const std::wstring& exeDir, const std::wstring& jreDir, c
     return true;
 }
 
+static std::wstring JStringToWString(JNIEnv* env, jstring s) {
+    if (!s) return L"";
+    const jchar* chars = env->GetStringChars(s, nullptr);
+    jsize len = env->GetStringLength(s);
+    std::wstring out(reinterpret_cast<const wchar_t*>(chars), len);
+    env->ReleaseStringChars(s, chars);
+    return out;
+}
+
+static void LogThrowable(JNIEnv* env, jthrowable t, const wchar_t* label) {
+    if (!t) return;
+
+    jclass throwableCls = env->FindClass("java/lang/Throwable");
+    jclass classCls = env->FindClass("java/lang/Class");
+    jclass elemCls = env->FindClass("java/lang/StackTraceElement");
+    if (!throwableCls || !classCls || !elemCls) { env->ExceptionClear(); return; }
+
+    jmethodID getClass     = env->GetMethodID(throwableCls, "getClass", "()Ljava/lang/Class;");
+    jmethodID getName      = env->GetMethodID(classCls, "getName", "()Ljava/lang/String;");
+    jmethodID getMessage   = env->GetMethodID(throwableCls, "getLocalizedMessage", "()Ljava/lang/String;");
+    jmethodID getStack     = env->GetMethodID(throwableCls, "getStackTrace", "()[Ljava/lang/StackTraceElement;");
+    jmethodID getCause     = env->GetMethodID(throwableCls, "getCause", "()Ljava/lang/Throwable;");
+    jmethodID elemToString = env->GetMethodID(elemCls, "toString", "()Ljava/lang/String;");
+
+    jobject cls   = env->CallObjectMethod(t, getClass);
+    jstring jname = (jstring)env->CallObjectMethod(cls, getName);
+    jstring jmsg  = (jstring)env->CallObjectMethod(t, getMessage);
+
+    WriteLogF(L"%s %s: %s", label,
+        JStringToWString(env, jname).c_str(),
+        jmsg ? JStringToWString(env, jmsg).c_str() : L"(no message)");
+
+    jobjectArray frames = (jobjectArray)env->CallObjectMethod(t, getStack);
+    if (frames) {
+        jsize n = env->GetArrayLength(frames);
+        for (jsize i = 0; i < n; ++i) {
+            jobject e = env->GetObjectArrayElement(frames, i);
+            jstring s = (jstring)env->CallObjectMethod(e, elemToString);
+            WriteLogF(L"    at %s", JStringToWString(env, s).c_str());
+            env->DeleteLocalRef(s);
+            env->DeleteLocalRef(e);
+        }
+        env->DeleteLocalRef(frames);
+    }
+
+    jthrowable cause = (jthrowable)env->CallObjectMethod(t, getCause);
+    if (cause && !env->IsSameObject(cause, t)) {
+        LogThrowable(env, cause, L"Caused by");
+        env->DeleteLocalRef(cause);
+    }
+
+    env->DeleteLocalRef(jname);
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    env->DeleteLocalRef(cls);
+
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
 static bool CheckAndLogJavaException(JNIEnv* env, const wchar_t* stage) {
     if (!env->ExceptionCheck()) return false;
+    jthrowable t = env->ExceptionOccurred();
+    env->ExceptionClear();
     WriteLogF(L"Java exception during %s", stage);
-    env->ExceptionDescribe();
+    LogThrowable(env, t, L"Exception");
+    env->DeleteLocalRef(t);
     return true;
 }
 
