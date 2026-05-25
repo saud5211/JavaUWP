@@ -413,7 +413,6 @@ static bool PreloadJvm(const std::wstring& exeDir, const std::wstring& jreDir, c
     loadPackaged(L"jre\\bin\\vcruntime140.dll", L"vcruntime140.dll");
     loadPackaged(L"jre\\bin\\vcruntime140_1.dll", L"vcruntime140_1.dll");    
     loadPackaged(L"jre\\bin\\msvcp140.dll", L"msvcp140.dll");
-    loadPackaged(L"jre\\bin\\java.dll", L"java.dll");
     loadPackaged(L"jre\\bin\\jli.dll", L"jli.dll");
 
     *jvmModule = loadPackaged(L"jre\\bin\\server\\jvm.dll", L"jvm.dll");
@@ -421,6 +420,8 @@ static bool PreloadJvm(const std::wstring& exeDir, const std::wstring& jreDir, c
         return false;
     }
 
+    loadPackaged(L"jre\\bin\\java.dll", L"java.dll");
+    
     WriteLog(L"JVM DLLs loaded");
     return true;
 }
@@ -544,7 +545,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         return false;
     }
 
-    jclass mainClass = env->FindClass("net.fabricmc.loader.impl.launch.knot.KnotClient");
+    jclass mainClass = env->FindClass("net/fabricmc/loader/impl/launch/knot/KnotClient");
     if (!mainClass || CheckAndLogJavaException(env, L"FindClass(KnotClient)")) {
         return false;
     }
