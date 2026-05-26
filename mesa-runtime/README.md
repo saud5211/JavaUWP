@@ -2,15 +2,31 @@
 
 Bundled Mesa UWP runtime DLLs for local builds live in this folder.
 
-Expected files:
-- libEGL.dll
-- libGLESv2.dll
-- opengl32.dll
-- libgallium_wgl.dll
-- libglapi.dll
-- glu32.dll
-- dxil.dll
-- z-1.dll
+Minimum files checked by the build:
 
-If you need to test a different Mesa build, point `build.ps1` at another folder
-with `-MesaRuntimeDir` or `MESA_UWP_DIR`.
+- `libEGL.dll`
+- `opengl32.dll`
+- `libgallium_wgl.dll`
+
+Other Mesa DLLs are copied when present:
+
+- `libGLESv2.dll`
+- `libGLESv1_CM.dll`
+- `libglapi.dll`
+- `spirv_to_dxil.dll`
+- `vulkan_dzn.dll`
+- `glu32.dll`
+- `dxil.dll`
+- `z-1.dll`
+
+Use another Mesa runtime with:
+
+```powershell
+.\build.ps1 -MesaRuntimeDir "C:\path\to\mesa-runtime"
+```
+
+Or:
+
+```powershell
+$env:MESA_UWP_DIR = "C:\path\to\mesa-runtime"
+```

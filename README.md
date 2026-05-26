@@ -1,101 +1,114 @@
 # Minecraft Java on Xbox UWP
 
-`MinecraftJavaUWP` is an experiment to run modern Minecraft Java Edition inside an Xbox Developer Mode UWP app.
+`MinecraftJavaUWP` is an experimental port of modern Minecraft Java Edition to an Xbox Developer Mode UWP app.
 
-This project does not emulate the game. It embeds a real JDK in-process, boots Fabric, and presents the game through a custom GLFW compatibility layer backed by UWP `CoreWindow` and Mesa EGL/D3D12.
+The app embeds a real JDK, starts Fabric inside the UWP process, and presents Minecraft through a custom GLFW layer backed by UWP `CoreWindow` and Mesa EGL on D3D12.
 
 ## Current state
 
-The project is past the proof-of-concept stage:
+The project is usable for active development:
 
-- the game boots on Xbox Developer Mode
-- menus render on screen
-- keyboard input works
-- singleplayer world loading reaches gameplay
-- the renderer uses Mesa on the Xbox GPU rather than a fake software path
+- Minecraft 1.21.11 with Fabric Loader 0.19.2 boots in Xbox Developer Mode.
+- Menus render through Mesa on the Xbox GPU.
+- Keyboard and basic text input work.
+- Single player reaches gameplay.
+- Multiplayer and skin loading have recent fixes.
+- Xbox controller input is exposed through GameInput in the GLFW shim.
+- The app includes generated UWP tile assets from the checked in icon.
+- The host seeds writable game state into `LocalState` on launch.
 
-It is still an experimental port, not a polished product.
+Expect rough edges. This is still a research port and development tool, not a release launcher.
 
-## What this repo contains
+## Repo layout
 
 - `MC.Xbox/`
-  UWP host app that embeds the JVM and starts Minecraft in-process.
+  UWP host app. It starts the JVM, publishes the `CoreWindow` for EGL, prepares writable state, and launches Fabric.
 - `glfw_shim/`
-  A GLFW-compatible shim that bridges LWJGL to UWP `CoreWindow` and EGL.
+  Replacement `glfw.dll` for LWJGL. It maps GLFW window, input, gamepad, and EGL calls onto UWP APIs.
 - `compat_mod/`
-  A small Fabric mod with targeted compatibility patches for sandboxed Xbox paths and related platform issues.
-- `build.ps1`
-  End-to-end packaging script for the UWP app.
+  Fabric compatibility mod with mixins for Minecraft code paths that break inside the Xbox sandbox.
+- `patch/`
+  Patched Fabric Loader classes used by `scripts/patch-fabric.ps1`.
 - `scripts/`
-  Setup, patching, cleanup, asset generation, shared configuration, and environment helper scripts.
-- `scripts/patch-fabric.ps1`
-  Patch step for Fabric loader path behavior that is incompatible with the Xbox sandbox.
+  Setup, cleanup, asset, patch, and shared build helper scripts.
+- `mesa-runtime/`
+  Mesa UWP runtime DLLs used by local builds.
+- `build.ps1`
+  Main build and package script.
 
-## Documentation
+## Build overview
 
-- [Building](docs/BUILDING.md) - setup requirements, local game/runtime files, patching, packaging, and troubleshooting.
-- [Patching notes](docs/PATCHING.md) - why the Fabric Loader patch, compatibility mod, and GLFW shim exist.
-- [Legal notes](docs/LEGAL.md) - repository license boundaries and third-party content rules.
+Read [docs/BUILDING.md](docs/BUILDING.md) for the complete setup. The short version is:
 
-For a clean local workspace, run `.\scripts\clean.ps1` first to preview ignored generated files. It does not delete anything unless you pass `-Apply`.
+```powershell
+.\scripts\download-libs.ps1
+.\scripts\download-assets.ps1
+java -jar .\staging\cache\tools\fabric-installer.jar client -dir .\staging\cache\gameDir -mcversion 1.21.11 -loader 0.19.2 -launcher win32 -noprofile
+.\build.ps1
+```
 
-Downloaded game/runtime inputs live under `staging\cache`, temporary package assembly lives under `staging\package`, and signed app packages are written to `output`.
+The build script compiles the UWP host, builds the GLFW shim, builds the compatibility mod, patches the local Fabric Loader JAR, copies assets and runtime files, injects the shim into the LWJGL GLFW native JAR, creates UWP tile assets, then signs `output\MC_Java_1.0.0.0.appx`.
+
+Generated files live under `staging` and `output`. They are ignored by git.
+
+## Local inputs
+
+You need to provide your own legal game and runtime inputs. This repo does not include:
+
+- Minecraft game files beyond files downloaded into your local ignored cache.
+- Mojang asset objects beyond files downloaded into your local ignored cache.
+- Fabric installer JAR.
+- A JRE image committed to git.
+- Signed app packages.
+- Local signing certificates.
+- Saves, logs, or local debug output.
+
+The Mesa UWP runtime DLLs needed by the build are tracked in `mesa-runtime/`.
 
 ## How it works
 
-At a high level:
-
 1. `MC.Xbox.exe` starts as a UWP app.
-2. The host publishes the live `CoreWindow` to app properties.
-3. The host loads `jvm.dll` in-process and starts a real Java VM.
-4. Fabric launches Minecraft from inside that same process.
-5. The custom `glfw.dll` shim creates an EGL surface for the UWP window.
-6. Mesa translates OpenGL calls to D3D12 on Xbox hardware.
+2. The app publishes the live `CoreWindow` through app properties.
+3. The app seeds `LocalState` with runtime files that need writable paths.
+4. The app loads `jvm.dll` and starts Java in the same process.
+5. Fabric launches Minecraft from the embedded JVM.
+6. LWJGL loads the custom `glfw.dll`.
+7. The GLFW shim creates an EGL surface for the UWP window.
+8. Mesa translates OpenGL calls to D3D12.
 
-That architecture exists because the normal desktop assumptions do not hold on Xbox Dev Mode:
+The main compatibility work is around Xbox sandbox paths, packaged app file access, native library loading, GLFW behavior, input, and Fabric remapping.
 
-- there is no usable desktop `HWND` path
-- packaged sandbox paths do not behave like normal Windows filesystem paths
-- parts of Minecraft, Fabric, LWJGL, and Java NIO need targeted compatibility work
+## Status and limits
 
-## What this repo does not include
+Known limits include:
 
-This repository is intentionally source-focused, but it also vendors the Mesa
-UWP runtime needed to run the project locally. It does not aim to redistribute:
+- Xbox Developer Mode is the only supported target.
+- Retail mode is not supported.
+- Path handling is still the most sensitive area.
+- Some Java platform diagnostics can still warn or fail because the sandbox does not look like desktop Windows.
+- Controller support exists through GameInput, but game controls still need testing and tuning.
+- Version bumps can break Fabric patches, the compatibility mod, or native runtime layout.
 
-- Minecraft game assets
-- Mojang libraries
-- a bundled JRE image in git
-- packaged appx builds
-- local signing certificates
-- local logs, saves, or debug output
+## Documentation
 
-If you clone this repo, expect to supply your own legal game files and local build environment.
+- [Building](docs/BUILDING.md)
+- [Patching notes](docs/PATCHING.md)
+- [Legal notes](docs/LEGAL.md)
 
-## Status and limitations
+For cleanup, preview first:
 
-Known rough edges include:
+```powershell
+.\scripts\clean.ps1
+```
 
-- sandbox-specific path handling is still an active area of work
-- some platform diagnostics code in the Java stack still emits JNA/OSHI warnings
-- controller support is not the focus yet
-- this has only been exercised in Xbox Developer Mode, not retail mode
+Then apply when the preview looks right:
 
-## Why this exists
-
-The point of the project is not "Minecraft launcher glue." The interesting part is proving that a modern Java game stack can be coerced into a UWP/Xbox sandbox that was never designed for it.
-
-That required solving problems across:
-
-- UWP app hosting
-- in-process JVM startup
-- native library loading inside packaged apps
-- EGL/GL presentation without Win32 window handles
-- path canonicalization failures in the Xbox sandbox
-- Fabric and Minecraft assumptions about a normal desktop filesystem
+```powershell
+.\scripts\clean.ps1 -Apply
+```
 
 ## License and ownership
 
-The original project code in this repository is available under the custom terms in [LICENSE](LICENSE): use is allowed with credit, but redistribution is not permitted without prior written permission from veroxsity / BanditVault.
+Original project code in this repository is available under the custom terms in [LICENSE](LICENSE). Use is allowed with credit. Redistribution requires prior written permission from veroxsity / BanditVault.
 
-Minecraft, Fabric, Mojang assets, and third-party runtime components remain subject to their own licenses and terms.
+Minecraft, Fabric, Mojang assets, Mesa, LWJGL, Java, and other third party components remain under their own licenses and terms.

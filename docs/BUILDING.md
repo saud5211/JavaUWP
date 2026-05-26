@@ -1,106 +1,115 @@
 # Building
 
-This repo ships the source and the Mesa UWP runtime needed for local builds.
-Downloaded game files, temporary package assembly, local notes, and certificates
-still live under ignored local directories.
+This page covers a clean local build from the repo root.
+
+The build produces a signed UWP package at:
+
+```text
+output\MC_Java_1.0.0.0.appx
+```
 
 ## Requirements
 
-- Windows with PowerShell 5+.
-- Visual Studio or Visual Studio Build Tools with the MSVC x64 toolchain.
-- Windows 10/11 SDK.
-- JDK 21 or newer. Set `JAVA_HOME` if it is not in a common location.
-- Python 3 with Pillow:
+- Windows with PowerShell 5.1 or newer.
+- Visual Studio or Visual Studio Build Tools with the MSVC x64 C++ tools.
+- Windows 10 or Windows 11 SDK.
+- JDK 21 or newer. Set `JAVA_HOME` if auto detection does not find it.
+- Python 3 with Pillow.
+- Fabric installer JAR at `staging\cache\tools\fabric-installer.jar`.
+- Minecraft native DLLs in `staging\cache\natives-1.21`.
+- Mesa UWP runtime DLLs in `mesa-runtime\`, or another folder passed to the build.
+
+Install Pillow:
 
 ```powershell
 py -m pip install pillow
 ```
 
-- Fabric installer JAR placed at `staging\cache\tools\fabric-installer.jar`.
-- A Mesa UWP runtime directory at `mesa-runtime\` containing:
-  `libEGL.dll`, `libGLESv2.dll`, `opengl32.dll`, `libgallium_wgl.dll`,
-  `libglapi.dll`, `glu32.dll`, `dxil.dll`, and `z-1.dll`.
+## Versions
 
-If you need to test with a different Mesa build, point the build at another
-directory with `-MesaRuntimeDir` or `MESA_UWP_DIR`.
-
-The bundled DLLs live in the tracked runtime folder:
-
-```text
-mesa-runtime\
-```
-
-Alternatively, pass the path when building:
-
-```powershell
-.\build.ps1 -MesaRuntimeDir "C:\path\to\mesa-uwp-runtime"
-```
-
-Or set an environment variable:
-
-```powershell
-$env:MESA_UWP_DIR = "C:\path\to\mesa-uwp-runtime"
-```
-
-`RETROARCH_UWP_DIR` is still accepted as a backward-compatible fallback.
-
-## Project Settings
-
-Version-sensitive settings live in `scripts/config.ps1`.
+Default versions live in `scripts/config.ps1`.
 
 Current defaults:
 
 - Minecraft: `1.21.11`
+- Asset index: `29`
 - Fabric Loader: `0.19.2`
 - Java release: `21`
 - LWJGL GLFW natives: `3.3.3`
 - JNA: `5.17.0`
 
-If you change Minecraft or Fabric versions, also update runtime metadata in:
+The main build accepts temporary overrides:
 
-- `MC.Xbox/App.cpp`
-- `MC.Xbox/launch.ps1`
+```powershell
+.\build.ps1 -McVersion 1.21.11 -FabricLoader 0.19.2 -AssetIndex 29
+```
+
+These values are passed into setup helpers and into the generated host header used by `MC.Xbox\App.cpp`.
+
+For a real version bump, update:
+
+- `scripts/config.ps1`
 - `compat_mod/src/main/resources/fabric.mod.json`
+- `MC.Xbox/launch.ps1` if you still use that legacy launch helper
 
-Those files are used inside the packaged app and cannot read the PowerShell
-config at runtime.
+Then recreate the local `gameDir`, assets, natives, remapped jars, and patched Fabric Loader.
 
-## Fresh Setup
+## Mesa runtime
 
-From the repo root:
+The repo includes the Mesa UWP runtime folder:
+
+```text
+mesa-runtime\
+```
+
+You can use a different runtime with:
+
+```powershell
+.\build.ps1 -MesaRuntimeDir "C:\path\to\mesa-runtime"
+```
+
+Or:
+
+```powershell
+$env:MESA_UWP_DIR = "C:\path\to\mesa-runtime"
+```
+
+`RETROARCH_UWP_DIR` is still accepted as a fallback search path. RetroArch is not required.
+
+## Fresh setup
+
+Create the local cache folders and place the Fabric installer here:
+
+```text
+staging\cache\tools\fabric-installer.jar
+```
+
+Download the Minecraft client libraries and assets for the configured version:
 
 ```powershell
 .\scripts\download-libs.ps1
 .\scripts\download-assets.ps1
+```
+
+Run the Fabric installer:
+
+```powershell
 java -jar .\staging\cache\tools\fabric-installer.jar client -dir .\staging\cache\gameDir -mcversion 1.21.11 -loader 0.19.2 -launcher win32 -noprofile
 ```
 
-Make sure these paths exist after setup:
+Put the needed Minecraft and LWJGL native DLLs here:
 
 ```text
-staging\cache\gameDir\libraries\net\fabricmc\fabric-loader\0.19.2\fabric-loader-0.19.2.jar
-staging\cache\gameDir\.fabric\remappedJars\minecraft-1.21.11-0.19.2\client-intermediary.jar
-staging\cache\assets\indexes\29.json
 staging\cache\natives-1.21\
 ```
 
-The `staging\cache\natives-1.21` directory is local-only. Put the native DLLs
-needed by the Minecraft/LWJGL runtime there. It is ignored by git.
+That folder is local only and ignored by git.
 
-## Patch Fabric Loader
+## Generate Fabric remapped jars
 
-Run:
+Fabric remapped jars are created by running the Fabric client once on the local desktop cache. This step is needed before the compatibility mod can compile.
 
-```powershell
-.\scripts\patch-fabric.ps1
-```
-
-This injects `patch/LoaderUtil.java` into your local Fabric Loader JAR to avoid
-the Xbox sandbox path canonicalization failure.
-
-## Run Fabric environment to generate missing files for building
-
-Run:
+Run this from the repo root:
 
 ```powershell
 $gameDir   = (Resolve-Path .\staging\cache\gameDir).Path
@@ -127,9 +136,27 @@ $javaArgs = @(
 )
 & "$env:JAVA_HOME\bin\java.exe" @javaArgs
 ```
-This generates the remaining missing files so the build script doesn't crash.
 
-## Build Package
+After setup, these paths should exist:
+
+```text
+staging\cache\gameDir\libraries\net\fabricmc\fabric-loader\0.19.2\fabric-loader-0.19.2.jar
+staging\cache\gameDir\.fabric\remappedJars\minecraft-1.21.11-0.19.2\client-intermediary.jar
+staging\cache\assets\indexes\29.json
+staging\cache\natives-1.21\
+```
+
+## Patch Fabric Loader
+
+The top level build runs this step automatically. You can also run it directly:
+
+```powershell
+.\scripts\patch-fabric.ps1
+```
+
+The script overlays patched Fabric Loader classes into the local ignored loader JAR under `staging\cache\gameDir`.
+
+## Build package
 
 Run:
 
@@ -137,22 +164,29 @@ Run:
 .\build.ps1
 ```
 
+Useful options:
+
+- `-KeepStaging` keeps `staging\package` after packaging.
+- `-SkipStopAppProcesses` skips the process cleanup that runs before packaging.
+- `-StopFileLockers` asks Windows Restart Manager to find processes that lock the output appx.
+- `-MesaRuntimeDir` points at another Mesa runtime folder.
+- `-McVersion`, `-FabricLoader`, and `-AssetIndex` override version values for this build.
+
 The build script:
 
-1. Builds `MC.Xbox.exe`.
-2. Builds the `glfw.dll` CoreWindow shim.
-3. Builds the compatibility Fabric mod.
-4. Assembles `staging\package`.
-5. Injects the GLFW shim into the LWJGL GLFW native JAR.
-6. Copies Mesa runtime DLLs.
-7. Copies assets, game files, natives, and the JRE.
-8. Generates placeholder UWP tile assets.
-9. Creates and signs `output\MC_Java_1.0.0.0.appx`.
-10. Removes `staging\package` unless `-KeepStaging` is passed.
+1. Generates `runtime_config.h` for the selected versions.
+2. Builds `MC.Xbox.exe`.
+3. Builds the UWP GLFW shim.
+4. Builds the Fabric compatibility mod.
+5. Patches the local Fabric Loader JAR.
+6. Assembles `staging\package`.
+7. Copies Minecraft libraries, versions, Fabric data, assets, natives, bundled mods, Mesa DLLs, and the JRE.
+8. Injects the custom `glfw.dll` into the LWJGL GLFW native JAR.
+9. Generates UWP tile and splash assets from `MC.Xbox\Assets\Java_UWP_Icon.png`.
+10. Creates and signs `output\MC_Java_1.0.0.0.appx`.
+11. Deletes `staging\package` unless `-KeepStaging` is set.
 
-Generated outputs are ignored by git.
-
-## Clean Local Outputs
+## Clean outputs
 
 Preview cleanup:
 
@@ -166,11 +200,16 @@ Apply cleanup:
 .\scripts\clean.ps1 -Apply
 ```
 
-The default cleanup removes build outputs only: `staging\build`,
-`staging\package`, `staging\certs`, `output`, and legacy root build artifacts.
-It keeps the cache under `staging\cache`.
+Default cleanup removes build outputs only:
 
-For a full ignored-file cleanup, including downloaded cache files:
+```text
+staging\build
+staging\package
+staging\certs
+output
+```
+
+To include all ignored files, including downloaded cache files:
 
 ```powershell
 .\scripts\clean.ps1 -Scope AllIgnored
@@ -179,12 +218,10 @@ For a full ignored-file cleanup, including downloaded cache files:
 
 ## Troubleshooting
 
-- `No suitable Java installation found`: set `JAVA_HOME` to a JDK 21 or newer
-  install.
+- `No suitable Java installation found`: set `JAVA_HOME` to a JDK 21 or newer install.
+- `No suitable Python installation found`: install Python 3 and Pillow, or set `PYTHON`.
 - `vswhere.exe not found`: install Visual Studio Build Tools with C++ tools.
-- `Mesa UWP runtime DLLs not found`: pass `-MesaRuntimeDir`, set
-  `MESA_UWP_DIR`, or restore the bundled DLLs in `mesa-runtime\`.
-- Missing `client-intermediary.jar`: rerun the Fabric install step and make sure
-  the Minecraft/Fabric versions match `scripts/config.ps1`.
-- Package signing failure: delete the ignored local `.pfx` and rerun
-  `build.ps1`, or set `APPX_CERT_SUBJECT` before building.
+- `Mesa UWP runtime DLLs not found`: pass `-MesaRuntimeDir`, set `MESA_UWP_DIR`, or restore `mesa-runtime\`.
+- Missing `client-intermediary.jar`: run the Fabric client once from the local desktop cache as shown above.
+- Missing native DLLs: fill `staging\cache\natives-1.21` with the native DLLs required by the Minecraft and LWJGL runtime.
+- Package signing failure: delete the ignored local `.pfx` under `staging\certs` and rerun `build.ps1`, or set `APPX_CERT_SUBJECT`.

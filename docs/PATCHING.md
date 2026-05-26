@@ -1,37 +1,48 @@
 # Patching Notes
 
-The project relies on a few targeted compatibility changes because desktop Java,
-LWJGL, Fabric, and Minecraft assume APIs that are not available in the Xbox UWP
-sandbox.
+Minecraft, Fabric, LWJGL, and Java expect desktop Windows behavior. Xbox Developer Mode UWP runs inside a packaged sandbox, so a few targeted patches are needed.
 
-## Fabric Loader Patch
+## Fabric Loader patch
 
-`patch/LoaderUtil.java` is a patched replacement for Fabric Loader's
-`net.fabricmc.loader.impl.util.LoaderUtil`.
+`scripts\patch-fabric.ps1` compiles Java sources from `patch\` and overlays the resulting classes into the local Fabric Loader JAR:
 
-The important change is in `normalizeExistingPath0`:
+```text
+staging\cache\gameDir\libraries\net\fabricmc\fabric-loader\0.19.2\fabric-loader-0.19.2.jar
+```
 
-- Desktop Fabric uses `Path.toRealPath()`.
-- On Xbox Developer Mode, that path calls into Windows behavior that relies on
-  `GetFinalPathNameByHandle`.
-- That call is blocked or unreliable in the packaged sandbox.
-- The patch uses `toAbsolutePath().normalize()` instead.
+Patched classes:
 
-Apply it with:
+- `LoaderUtil`
+- `FileSystemUtil`
+- `FileSystemReference`
+- `OutputConsumerPath`
+- `FabricLauncherBase`
+
+The main goals are:
+
+- Avoid `Path.toRealPath()` in places where the Xbox sandbox blocks or breaks the underlying Windows path query.
+- Keep Fabric remapping from using file system calls that fail in packaged app paths.
+- Make loader launch behavior tolerate the UWP runtime layout.
+
+Run it directly with:
 
 ```powershell
 .\scripts\patch-fabric.ps1
 ```
 
-The script compiles the patched class and updates the local Fabric Loader JAR in
-`staging\cache\gameDir`. It does not modify tracked third-party files because the
-cache is ignored.
+The top level build also runs it automatically.
 
-## Compatibility Mod
+## Compatibility mod
 
-`compat_mod` is a small Fabric mod with targeted mixins for sandbox-specific
-behavior. The build script compiles it against the remapped Minecraft client JAR
-and puts the result in `gameDir\mods`.
+`compat_mod` is a Fabric client mod with mixins for Minecraft code paths that need sandbox aware behavior.
+
+Current mixins:
+
+- `MinecraftClientProbeMixin`
+- `PathUtilBypassMixin`
+- `SystemDetailsOshiBypassMixin`
+- `WorldLoadProgressTrackerMixin`
+- `ZipFsBypassMixin`
 
 Build it directly with:
 
@@ -39,12 +50,19 @@ Build it directly with:
 .\compat_mod\build_compat_mod.ps1
 ```
 
-The top-level `build.ps1` runs this automatically.
+The build copies the mod JAR into the local ignored `gameDir\mods` folder. The top level package step then places bundled mods under `runtime\bundled-mods`, and the UWP host copies them into writable `LocalState` on launch.
 
-## GLFW Shim
+## GLFW shim
 
-`glfw_shim/glfw_uwp.cpp` builds a replacement `glfw.dll` for LWJGL GLFW. It
-bridges Minecraft's GLFW calls to UWP `CoreWindow` and EGL.
+`glfw_shim\glfw_uwp.cpp` builds a replacement `glfw.dll` for LWJGL GLFW.
+
+It handles:
+
+- `CoreWindow` based window setup.
+- EGL surface creation for Mesa.
+- Keyboard and text input callbacks.
+- Basic monitor, cursor, timing, and window API responses expected by LWJGL.
+- Xbox controller state through GameInput and the GLFW joystick and gamepad APIs.
 
 Build it directly with:
 
@@ -52,19 +70,30 @@ Build it directly with:
 .\glfw_shim\build_glfw.ps1
 ```
 
-The top-level build copies the DLL into `staging\package\natives` and injects it
-into the LWJGL GLFW native JAR inside the assembled package.
+The top level build copies the DLL into package natives and injects it into the LWJGL GLFW native JAR inside the assembled package.
 
-## Version Bumps
+## Runtime layout
 
-When changing Minecraft, Fabric Loader, or key library versions:
+The packaged app keeps immutable runtime files under the package folder. At launch, `MC.Xbox.exe` prepares writable state in `LocalState`:
 
-1. Update `scripts/config.ps1`.
-2. Update runtime constants in `MC.Xbox/App.cpp`.
-3. Update fallback launch values in `MC.Xbox/launch.ps1`.
-4. Update dependency metadata in `compat_mod/src/main/resources/fabric.mod.json`.
-5. Recreate local `gameDir`, `assets`, and `natives-*` content.
-6. Rerun `scripts\patch-fabric.ps1` and `build.ps1`.
+```text
+LocalState\game
+LocalState\assets
+LocalState\natives
+```
 
-Avoid committing generated game files, runtime files, certificates, or app
-packages.
+The game uses `LocalState\game` for saves, config, logs, mods, and other writable files. Bundled compatibility mods are copied there during launch.
+
+## Version bumps
+
+When changing Minecraft, Fabric Loader, or key libraries:
+
+1. Update `scripts/config.ps1`, or pass build overrides while testing.
+2. Update `compat_mod/src/main/resources/fabric.mod.json`.
+3. Recreate `staging\cache\gameDir`.
+4. Recreate `staging\cache\assets`.
+5. Recreate `staging\cache\natives-1.21` if native versions changed.
+6. Run the local Fabric client once so remapped jars are generated.
+7. Run `.\build.ps1`.
+
+Do not commit generated game files, downloaded assets, natives, certificates, app packages, logs, or saves.
