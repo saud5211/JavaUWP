@@ -25,7 +25,8 @@ Write-Host "Compiling patched Fabric loader classes..."
     (Join-Path $patch "LoaderUtil.java"),
     (Join-Path $patch "FileSystemUtil.java"),
     (Join-Path $patch "FileSystemReference.java"),
-    (Join-Path $patch "OutputConsumerPath.java")
+    (Join-Path $patch "OutputConsumerPath.java"),
+    (Join-Path $patch "FabricLauncherBase.java")
 )
 if ($LASTEXITCODE -ne 0) { throw "Compile failed" }
 
@@ -45,7 +46,9 @@ $classFiles = @(
     "net\fabricmc\loader\impl\lib\tinyremapper\FileSystemReference.class",
     "net\fabricmc\loader\impl\lib\tinyremapper\OutputConsumerPath.class",
     "net\fabricmc\loader\impl\lib\tinyremapper\OutputConsumerPath`$Builder.class",
-    "net\fabricmc\loader\impl\lib\tinyremapper\OutputConsumerPath`$ResourceRemapper.class"
+    "net\fabricmc\loader\impl\lib\tinyremapper\OutputConsumerPath`$ResourceRemapper.class",
+    "net\fabricmc\loader\impl\launch\FabricLauncherBase.class",
+    "net\fabricmc\loader\impl\launch\FabricLauncherBase`$1.class"
 )
 foreach ($classFile in $classFiles) {
     $src = Join-Path $classesTmp $classFile
@@ -83,4 +86,4 @@ if ($LASTEXITCODE -ne 0) { throw "JAR repack failed" }
 Move-Item -LiteralPath $patchedLoader -Destination $loader -Force
 
 Write-Host "Done - fabric-loader-$loaderVersion.jar patched"
-Write-Host "Classes injected: LoaderUtil, FileSystemUtil, TinyRemapper FileSystemReference, OutputConsumerPath"
+Write-Host "Classes injected: LoaderUtil, FileSystemUtil, TinyRemapper FileSystemReference, OutputConsumerPath, FabricLauncherBase"
