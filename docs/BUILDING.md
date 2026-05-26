@@ -174,7 +174,7 @@ staging\cache\assets\indexes\29.json
 staging\cache\natives-1.21\
 ```
 
-If all of those are there, download Controlify and YetAnotherConfigLib, and put the .jar files into `staging\cache\gameDir\mods`
+If all of those are there, download Fabric API, Controlify and YetAnotherConfigLib, and put the .jar files into `staging\cache\gameDir\mods`
 
 ## Patch Fabric Loader
 
