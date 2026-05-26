@@ -118,7 +118,8 @@ OpenAL.dll
 ```
 
 ## Obtain your account credentials
-THIS WILL ONLY BE NECESSARY UNTIL WE IMPLEMENT PROPER AUTHENTICATION.
+
+**THIS WILL ONLY BE NECESSARY UNTIL WE IMPLEMENT PROPER AUTHENTICATION.**
 
 - Go to https://kqzz.github.io/mc-bearer-token/ and follow the instructions listed on there to obtain your accessToken
 - Go to https://mcuuid.net/ to obtain your account UUID
