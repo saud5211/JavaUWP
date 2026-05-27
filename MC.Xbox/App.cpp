@@ -612,10 +612,13 @@ struct AuthUiState {
     QrMatrix qr;
 };
 
+static void ProcessAuthUiEvents();
+
 class AuthScreenRenderer {
 public:
     bool Initialize(ICoreWindow* window) {
         if (!window) return false;
+        WriteLog(L"Auth screen Initialize started");
         window_ = window;
 
         Rect bounds = {};
@@ -626,7 +629,7 @@ public:
         width_ = bounds.Width > 0 ? bounds.Width : 1280;
         height_ = bounds.Height > 0 ? bounds.Height : 720;
 
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         D3D_FEATURE_LEVEL levels[] = {
             D3D_FEATURE_LEVEL_11_1,
             D3D_FEATURE_LEVEL_11_0,
@@ -646,8 +649,22 @@ public:
             &level,
             d3dContext_.GetAddressOf());
         if (FAILED(hr)) {
-            WriteLogF(L"Auth screen D3D11CreateDevice failed hr=0x%08X", hr);
-            return false;
+            WriteLogF(L"Auth screen D3D11CreateDevice hardware failed hr=0x%08X; trying WARP", hr);
+            hr = D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_WARP,
+                nullptr,
+                flags,
+                levels,
+                ARRAYSIZE(levels),
+                D3D11_SDK_VERSION,
+                d3dDevice_.ReleaseAndGetAddressOf(),
+                &level,
+                d3dContext_.ReleaseAndGetAddressOf());
+            if (FAILED(hr)) {
+                WriteLogF(L"Auth screen D3D11CreateDevice failed hr=0x%08X", hr);
+                return false;
+            }
         }
 
         hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf());
@@ -658,7 +675,10 @@ public:
 
         ComPtr<IDXGIDevice> dxgiDevice;
         hr = d3dDevice_.As(&dxgiDevice);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen IDXGIDevice query failed hr=0x%08X", hr);
+            return false;
+        }
 
         hr = d2dFactory_->CreateDevice(dxgiDevice.Get(), d2dDevice_.GetAddressOf());
         if (FAILED(hr)) {
@@ -674,15 +694,21 @@ public:
 
         ComPtr<IDXGIAdapter> adapter;
         hr = dxgiDevice->GetAdapter(adapter.GetAddressOf());
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen DXGI adapter failed hr=0x%08X", hr);
+            return false;
+        }
 
         ComPtr<IDXGIFactory2> dxgiFactory;
         hr = adapter->GetParent(IID_PPV_ARGS(dxgiFactory.GetAddressOf()));
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen DXGI factory failed hr=0x%08X", hr);
+            return false;
+        }
 
         DXGI_SWAP_CHAIN_DESC1 desc = {};
-        desc.Width = 0;
-        desc.Height = 0;
+        desc.Width = static_cast<UINT>(width_);
+        desc.Height = static_cast<UINT>(height_);
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.Stereo = FALSE;
         desc.SampleDesc.Count = 1;
@@ -706,7 +732,10 @@ public:
 
         ComPtr<IDXGISurface> backBuffer;
         hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf()));
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen back buffer failed hr=0x%08X", hr);
+            return false;
+        }
 
         D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
             D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
@@ -730,6 +759,8 @@ public:
         }
 
         CreateTextFormats();
+        WriteLogF(L"Auth screen initialized %.0fx%.0f featureLevel=0x%X",
+            width_, height_, static_cast<unsigned int>(level));
         return true;
     }
 
@@ -804,7 +835,11 @@ public:
         if (FAILED(hr)) {
             WriteLogF(L"Auth screen EndDraw failed hr=0x%08X", hr);
         }
-        swapChain_->Present(1, 0);
+        hr = swapChain_->Present(1, 0);
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen Present failed hr=0x%08X", hr);
+        }
+        ProcessAuthUiEvents();
     }
 
 private:
@@ -891,12 +926,34 @@ private:
 
 static void ProcessAuthUiEvents() {
     if (!g_authWindow) return;
+    static bool dispatcherErrorLogged = false;
 
     ComPtr<ICoreDispatcher> dispatcher;
-    if (FAILED(g_authWindow->get_Dispatcher(dispatcher.GetAddressOf())) || !dispatcher) {
+    HRESULT hr = g_authWindow->get_Dispatcher(dispatcher.GetAddressOf());
+    if (FAILED(hr) || !dispatcher) {
+        if (!dispatcherErrorLogged) {
+            dispatcherErrorLogged = true;
+            WriteLogF(L"Auth screen get_Dispatcher failed hr=0x%08X", hr);
+        }
         return;
     }
-    dispatcher->ProcessEvents(CoreProcessEventsOption_ProcessAllIfPresent);
+
+    boolean hasThreadAccess = false;
+    hr = dispatcher->get_HasThreadAccess(&hasThreadAccess);
+    if (FAILED(hr) || !hasThreadAccess) {
+        if (!dispatcherErrorLogged) {
+            dispatcherErrorLogged = true;
+            WriteLogF(L"Auth screen dispatcher access unavailable hr=0x%08X access=%d",
+                hr, hasThreadAccess ? 1 : 0);
+        }
+        return;
+    }
+
+    hr = dispatcher->ProcessEvents(CoreProcessEventsOption_ProcessAllIfPresent);
+    if (FAILED(hr) && !dispatcherErrorLogged) {
+        dispatcherErrorLogged = true;
+        WriteLogF(L"Auth screen ProcessEvents failed hr=0x%08X", hr);
+    }
 }
 
 static void RenderAuth(AuthScreenRenderer* renderer, const AuthUiState& state) {
@@ -1689,7 +1746,10 @@ public:
             WriteLogF(L"SetWindow: failed to query ICoreWindowInterop hr=0x%08X", g_windowInteropHr);
         }
         PublishCoreWindowProperty(window);
-        window->Activate();
+        HRESULT activateHr = window->Activate();
+        if (FAILED(activateHr)) {
+            WriteLogF(L"SetWindow: CoreWindow.Activate failed hr=0x%08X", activateHr);
+        }
         return S_OK;
     }
 
