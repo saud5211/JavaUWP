@@ -272,7 +272,7 @@ $env:LIB = "$($tools.MsvcRoot)\lib\x64;${sdkRoot}Lib\$sdkVer\ucrt\x64;${sdkRoot}
 & $tools.ClExe App.cpp /std:c++17 /EHsc /W3 /O2 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS /Fo"$mcBuildDir\" `
     /DWINAPI_FAMILY=WINAPI_FAMILY_APP `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /MACHINE:X64 `
-    /OUT:"$mcExe" kernel32.lib shell32.lib runtimeobject.lib windowsapp.lib ole32.lib oleaut32.lib d2d1.lib dwrite.lib d3d11.lib dxgi.lib
+    /OUT:"$mcExe" kernel32.lib shell32.lib runtimeobject.lib windowsapp.lib ole32.lib oleaut32.lib d2d1.lib dwrite.lib d3d11.lib dxgi.lib windowscodecs.lib
 if ($LASTEXITCODE -ne 0) { throw "Compile failed" }
 Pop-Location
 Write-Host "MC.Xbox.exe built"
@@ -386,6 +386,17 @@ foreach ($dll in Get-MesaRuntimeDllNames) {
 Write-Host "Copying assets..."
 Copy-Item -Recurse -Force (Join-Path $assetsDir "*") (Join-Path $pkg "assets\")
 Copy-Item -Force (Join-Path $root "log_configs\client-uwp.xml") (Join-Path $pkg "runtime\log_configs\client-uwp.xml")
+
+$panoramaSource = Join-Path $root "MC.Xbox\Assets\panorama"
+if (Test-Path $panoramaSource) {
+    $panoramaTarget = Join-Path $pkg "Assets\panorama"
+    New-Item -ItemType Directory -Force -Path $panoramaTarget | Out-Null
+    Copy-Item -Force (Join-Path $panoramaSource "panorama_*.png") $panoramaTarget
+    if (Test-Path (Join-Path $panoramaSource "panorama_overlay.png")) {
+        Copy-Item -Force (Join-Path $panoramaSource "panorama_overlay.png") $panoramaTarget
+    }
+    Write-Host "Copied menu panorama assets from $panoramaSource"
+}
 
 Write-Host "Copying JRE..."
 Write-Host "JRE source: $jreSrc"

@@ -24,10 +24,12 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <cmath>
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <d3d11_1.h>
 #include <dxgi1_3.h>
+#include <wincodec.h>
 #include <sstream>
 #include <iomanip>
 #include <winrt/base.h>
@@ -786,6 +788,15 @@ public:
             return false;
         }
 
+        hr = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(wicFactory_.GetAddressOf()));
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen WIC factory failed hr=0x%08X", hr);
+        }
+
         CreateTextFormats();
         WriteLogF(L"Auth screen initialized %.0fx%.0f featureLevel=0x%X",
             width_, height_, static_cast<unsigned int>(level));
@@ -863,26 +874,10 @@ public:
             const D2D1_RECT_F preview = D2D1::RectF(previewLeft, top, previewRight, frame.bottom - 34.0f);
             d2dContext_->FillRectangle(preview, black.Get());
             d2dContext_->DrawRectangle(preview, white.Get(), 2.0f);
-
-            ComPtr<ID2D1SolidColorBrush> sky;
-            ComPtr<ID2D1SolidColorBrush> ridge;
-            ComPtr<ID2D1SolidColorBrush> water;
-            d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x2F6F9F), sky.GetAddressOf());
-            d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x315D35), ridge.GetAddressOf());
-            d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x1B425A), water.GetAddressOf());
             const float inset = 8.0f;
             const D2D1_RECT_F pano = D2D1::RectF(preview.left + inset, preview.top + inset, preview.right - inset, preview.bottom - inset);
-            d2dContext_->FillRectangle(pano, sky.Get());
-            const float phase = static_cast<float>(static_cast<int>(state.animation * 45.0f) % 96);
-            for (int i = -1; i < 8; ++i) {
-                const float x = pano.left + i * 96.0f - phase;
-                const float peak = pano.top + 96.0f + ((i % 2) ? 28.0f : 0.0f);
-                d2dContext_->FillRectangle(D2D1::RectF(x, peak, x + 132.0f, pano.bottom - 72.0f), ridge.Get());
-            }
-            d2dContext_->FillRectangle(D2D1::RectF(pano.left, pano.bottom - 86.0f, pano.right, pano.bottom), water.Get());
+            DrawPanorama(pano, state.animation);
 
-            const D2D1_RECT_F previewText = D2D1::RectF(preview.left + 26.0f, preview.top + 34.0f, preview.right - 26.0f, preview.top + 154.0f);
-            DrawText(L"Minecraft\nanimated\nsplash screen", bodyFormat_.Get(), previewText, white.Get());
             if (!state.detail.empty()) {
                 const D2D1_RECT_F detailRect = D2D1::RectF(preview.left + 26.0f, preview.bottom - 82.0f, preview.right - 26.0f, preview.bottom - 24.0f);
                 DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
@@ -980,9 +975,14 @@ private:
     ComPtr<ID2D1DeviceContext> d2dContext_;
     ComPtr<ID2D1Bitmap1> targetBitmap_;
     ComPtr<IDWriteFactory> dwriteFactory_;
+    ComPtr<IWICImagingFactory> wicFactory_;
     ComPtr<IDWriteTextFormat> codeFormat_;
     ComPtr<IDWriteTextFormat> bodyFormat_;
     ComPtr<IDWriteTextFormat> smallFormat_;
+    ComPtr<ID2D1Bitmap1> panoramaFaces_[6];
+    ComPtr<ID2D1Bitmap1> panoramaOverlay_;
+    bool panoramaLoadAttempted_ = false;
+    bool panoramaLoaded_ = false;
     float width_ = 1280.0f;
     float height_ = 720.0f;
 
@@ -1021,6 +1021,135 @@ private:
             rect,
             brush,
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    bool LoadBitmapFromFile(const std::wstring& path, ComPtr<ID2D1Bitmap1>& out) {
+        if (!wicFactory_ || !d2dContext_) return false;
+
+        ComPtr<IWICBitmapDecoder> decoder;
+        HRESULT hr = wicFactory_->CreateDecoderFromFilename(
+            path.c_str(),
+            nullptr,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnLoad,
+            decoder.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Panorama decoder failed %s hr=0x%08X", path.c_str(), hr);
+            return false;
+        }
+
+        ComPtr<IWICBitmapFrameDecode> frame;
+        hr = decoder->GetFrame(0, frame.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Panorama frame failed %s hr=0x%08X", path.c_str(), hr);
+            return false;
+        }
+
+        ComPtr<IWICFormatConverter> converter;
+        hr = wicFactory_->CreateFormatConverter(converter.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Panorama converter create failed hr=0x%08X", hr);
+            return false;
+        }
+
+        hr = converter->Initialize(
+            frame.Get(),
+            GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom);
+        if (FAILED(hr)) {
+            WriteLogF(L"Panorama converter init failed %s hr=0x%08X", path.c_str(), hr);
+            return false;
+        }
+
+        const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.0f,
+            96.0f);
+        hr = d2dContext_->CreateBitmapFromWicBitmap(converter.Get(), &props, out.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Panorama D2D bitmap failed %s hr=0x%08X", path.c_str(), hr);
+            return false;
+        }
+
+        return true;
+    }
+
+    void EnsurePanoramaLoaded() {
+        if (panoramaLoadAttempted_) return;
+        panoramaLoadAttempted_ = true;
+
+        const std::wstring dir = GetExecutableDir() + L"\\Assets\\panorama";
+        int loaded = 0;
+        for (int i = 0; i < 6; ++i) {
+            const std::wstring path = dir + L"\\panorama_" + std::to_wstring(i) + L".png";
+            if (LoadBitmapFromFile(path, panoramaFaces_[i])) {
+                ++loaded;
+            }
+        }
+
+        LoadBitmapFromFile(dir + L"\\panorama_overlay.png", panoramaOverlay_);
+        panoramaLoaded_ = loaded == 6;
+        WriteLogF(L"Panorama loaded faces=%d overlay=%d",
+            loaded,
+            panoramaOverlay_ ? 1 : 0);
+    }
+
+    void DrawPanoramaFallback(D2D1_RECT_F rect, float animation) {
+        d2dContext_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_ALIASED);
+        ComPtr<ID2D1SolidColorBrush> sky;
+        ComPtr<ID2D1SolidColorBrush> ridge;
+        ComPtr<ID2D1SolidColorBrush> water;
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x2F6F9F), sky.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x315D35), ridge.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x1B425A), water.GetAddressOf());
+        d2dContext_->FillRectangle(rect, sky.Get());
+        const float phase = static_cast<float>(static_cast<int>(animation * 45.0f) % 96);
+        for (int i = -1; i < 8; ++i) {
+            const float x = rect.left + i * 96.0f - phase;
+            const float peak = rect.top + 96.0f + ((i % 2) ? 28.0f : 0.0f);
+            d2dContext_->FillRectangle(D2D1::RectF(x, peak, x + 132.0f, rect.bottom - 72.0f), ridge.Get());
+        }
+        d2dContext_->FillRectangle(D2D1::RectF(rect.left, rect.bottom - 86.0f, rect.right, rect.bottom), water.Get());
+        d2dContext_->PopAxisAlignedClip();
+    }
+
+    void DrawPanorama(D2D1_RECT_F rect, float animation) {
+        EnsurePanoramaLoaded();
+        if (!panoramaLoaded_) {
+            DrawPanoramaFallback(rect, animation);
+            return;
+        }
+
+        d2dContext_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_ALIASED);
+        const float height = rect.bottom - rect.top;
+        const float faceWidth = height;
+        const float stripWidth = faceWidth * 6.0f;
+        float offset = fmodf(animation * 22.0f, stripWidth);
+        if (offset < 0.0f) offset += stripWidth;
+
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            const float repeatStart = rect.left - offset + (repeat - 1) * stripWidth;
+            for (int i = 0; i < 6; ++i) {
+                ID2D1Bitmap1* bitmap = panoramaFaces_[i].Get();
+                if (!bitmap) continue;
+                const D2D1_RECT_F dest = D2D1::RectF(
+                    repeatStart + i * faceWidth,
+                    rect.top,
+                    repeatStart + (i + 1) * faceWidth,
+                    rect.bottom);
+                if (dest.right < rect.left || dest.left > rect.right) continue;
+                d2dContext_->DrawBitmap(bitmap, dest, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
+            }
+        }
+
+        if (panoramaOverlay_) {
+            d2dContext_->DrawBitmap(panoramaOverlay_.Get(), rect, 0.48f, D2D1_INTERPOLATION_MODE_LINEAR);
+        }
+        d2dContext_->PopAxisAlignedClip();
     }
 
     void DrawQr(const QrMatrix& qr, D2D1_RECT_F rect, ID2D1Brush* white, ID2D1Brush* black, ID2D1Brush* muted) {
