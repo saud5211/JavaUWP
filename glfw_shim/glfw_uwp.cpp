@@ -272,6 +272,7 @@ typedef void* (WINAPI* PFN_eglGetProcAddress)(const char*);
 typedef EGLint (WINAPI* PFN_eglGetError)(void);
 typedef EGLBoolean (WINAPI* PFN_eglGetConfigAttrib)(EGLDisplay, EGLConfig, EGLint, EGLint*);
 typedef const unsigned char* (APIENTRY* PFN_glGetString)(unsigned int);
+typedef void (*PFN_proc_init)(void);
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -1057,6 +1058,15 @@ static bool LoadMesaEGL() {
     if (!g_opengl32 || !g_libEGL) {
         ShimLog("Graphics loader failed gl=%p egl=%p err=%u", g_opengl32, g_libEGL, GetLastError());
         return false;
+    }
+
+    PFN_proc_init procInit = (PFN_proc_init)GetProcAddress(g_opengl32, "proc_init");
+    if (procInit) {
+        ShimLog("Calling opengl32!proc_init");
+        procInit();
+        ShimLog("opengl32!proc_init returned");
+    } else if (g_graphicsRuntimeUsesGles) {
+        ShimLog("opengl32!proc_init not exported");
     }
 
     p_eglGetDisplay = (PFN_eglGetDisplay)ResolveProc(g_libEGL, "eglGetDisplay");
