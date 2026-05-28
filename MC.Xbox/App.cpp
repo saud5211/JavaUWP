@@ -214,6 +214,7 @@ static bool ReadTextFile(const std::wstring& path, std::wstring& out) {
 
 static bool WriteTextFile(const std::wstring& path, const std::wstring& value) {
     EnsureDirectoryTree(GetParentDir(path));
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
 
@@ -324,6 +325,18 @@ static bool SeedLocalRuntime(
         progress(L"Copying Java runtime", L"Preparing JVM files", 0.68f);
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\jre", localDir + L"\\jre");
+    std::wstring xboxSecurityProperties;
+    if (ReadTextFile(packageDir + L"\\xbox_security.properties", xboxSecurityProperties)) {
+        const std::wstring localSecurityDir = localDir + L"\\jre\\conf\\security";
+        if (!WriteTextFile(localSecurityDir + L"\\java.security", xboxSecurityProperties)) {
+            WriteLogF(L"Failed to rewrite LocalState java.security err=%u", GetLastError());
+        }
+        if (!WriteTextFile(localSecurityDir + L"\\xbox.properties", xboxSecurityProperties)) {
+            WriteLogF(L"Failed to write LocalState xbox.properties err=%u", GetLastError());
+        }
+    } else {
+        WriteLogF(L"Failed to read packaged xbox_security.properties err=%u", GetLastError());
+    }
     if (progress) {
         progress(L"Copying native libraries", L"Preparing graphics and input runtime", 0.84f);
     }
@@ -333,9 +346,6 @@ static bool SeedLocalRuntime(
         progress(L"Finalizing runtime", L"Writing launch configuration", 0.96f);
     }
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
-    CopyFileIfNeeded(
-        packageDir + L"\\xbox_security.properties",
-        localDir + L"\\jre\\conf\\security\\xbox.properties");
     if (progress) {
         progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
     }

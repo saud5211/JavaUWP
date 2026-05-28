@@ -427,7 +427,9 @@ if (Test-Path $panoramaSource) {
 Write-Host "Copying JRE..."
 Write-Host "JRE source: $jreSrc"
 Copy-Item -Recurse $jreSrc (Join-Path $pkg "jre")
-Copy-Item (Join-Path $root "xbox_security.properties") (Join-Path $pkg "jre\conf\security\xbox.properties")
+$xboxSecurityProperties = Join-Path $root "xbox_security.properties"
+Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\xbox.properties") -Force
+Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\java.security") -Force
 
 Write-Host "Generating UWP tile assets..."
 & $pythonExe (Join-Path $root "scripts\generate-assets.py") $pkg
