@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-#include <stdlib.h>
 #include <roapi.h>
 #include <wrl.h>
 #include <wrl/wrappers/corewrappers.h>
@@ -377,10 +376,6 @@ static GLFWvidmode g_vidmode = {1920,1080,8,8,8,60};
 // Logging
 // ---------------------------------------------------------------------------
 static wchar_t g_log_path[MAX_PATH];
-static char g_mobileGluesDirUtf8[MAX_PATH * 4];
-static char g_mobileGluesConfigPathUtf8[MAX_PATH * 4];
-static char g_mobileGluesLogPathUtf8[MAX_PATH * 4];
-static char g_mobileGluesGlslCachePathUtf8[MAX_PATH * 4];
 
 static void ShimLog(const char* fmt, ...) {
     if (!g_log_path[0]) return;
@@ -420,143 +415,6 @@ static void JoinPath(wchar_t* out, int cch, const wchar_t* dir, const wchar_t* n
         return;
     }
     swprintf_s(out, cch, L"%s\\%s", dir, name);
-}
-
-static bool WideToUtf8(const wchar_t* src, char* out, int outCch) {
-    if (!src || !*src || !out || outCch <= 0) return false;
-    const int written = WideCharToMultiByte(CP_UTF8, 0, src, -1, out, outCch, nullptr, nullptr);
-    if (written > 0) return true;
-    const int fallback = WideCharToMultiByte(CP_ACP, 0, src, -1, out, outCch, nullptr, nullptr);
-    return fallback > 0;
-}
-
-static bool PeImageContainsRva(HMODULE module, DWORD rva, DWORD bytes) {
-    if (!module) return false;
-
-    const BYTE* base = (const BYTE*)module;
-    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-
-    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-
-    const DWORD imageSize = nt->OptionalHeader.SizeOfImage;
-    return rva < imageSize && bytes <= imageSize - rva;
-}
-
-static bool PatchByte(HMODULE module, DWORD rva, BYTE value, const char* label) {
-    if (!PeImageContainsRva(module, rva, 1)) return false;
-
-    BYTE* address = (BYTE*)module + rva;
-    if (*address == value) {
-        ShimLog("%s already patched", label);
-        return true;
-    }
-
-    DWORD oldProtect = 0;
-    if (!VirtualProtectFromApp(address, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        ShimLog("%s patch protect failed err=%u", label, GetLastError());
-        return false;
-    }
-
-    *address = value;
-    FlushInstructionCache(GetCurrentProcess(), address, 1);
-
-    DWORD ignored = 0;
-    VirtualProtectFromApp(address, 1, oldProtect, &ignored);
-    ShimLog("%s patched at rva=0x%08X", label, rva);
-    return true;
-}
-
-static void SeedMobileGluesDirectorySlot(HMODULE module, const char* mgDir) {
-    if (!g_graphicsRuntimeUsesGles || !module || !mgDir || !*mgDir) return;
-
-    // The judge-supplied UWP DLL reads this path global before proc_init loads
-    // config paths. Verify nearby string RVAs before touching the writable slot.
-    const DWORD kConfigJsonRva = 0x2abef8;
-    const DWORD kGlslCacheRva = 0x2abf08;
-    const DWORD kLatestLogRva = 0x2abf18;
-    const DWORD kInitConfigRva = 0x40c0;
-    const DWORD kMgDirectoryPathSlotRva = 0x3012b0;
-    const DWORD kConfigPathSlotRva = 0x3012c0;
-    const DWORD kGlslCachePathSlotRva = 0x3012c8;
-    const DWORD kLogPathSlotRva = 0x3012d0;
-
-    if (!PeImageContainsRva(module, kConfigJsonRva, 12) ||
-        !PeImageContainsRva(module, kGlslCacheRva, 16) ||
-        !PeImageContainsRva(module, kLatestLogRva, 12) ||
-        !PeImageContainsRva(module, kMgDirectoryPathSlotRva, sizeof(char*)) ||
-        !PeImageContainsRva(module, kConfigPathSlotRva, sizeof(char*)) ||
-        !PeImageContainsRva(module, kGlslCachePathSlotRva, sizeof(char*)) ||
-        !PeImageContainsRva(module, kLogPathSlotRva, sizeof(char*))) {
-        ShimLog("MobileGlues path slot layout not recognized");
-        return;
-    }
-
-    BYTE* base = (BYTE*)module;
-    const char* configJson = (const char*)(base + kConfigJsonRva);
-    const char* glslCache = (const char*)(base + kGlslCacheRva);
-    const char* latestLog = (const char*)(base + kLatestLogRva);
-    if (strcmp(configJson, "/config.json") != 0 ||
-        strcmp(glslCache, "/glsl_cache.tmp") != 0 ||
-        strcmp(latestLog, "/latest.log") != 0) {
-        ShimLog("MobileGlues path slot signature mismatch");
-        return;
-    }
-
-    *(char**)(base + kMgDirectoryPathSlotRva) = (char*)mgDir;
-    *(char**)(base + kConfigPathSlotRva) = g_mobileGluesConfigPathUtf8;
-    *(char**)(base + kGlslCachePathSlotRva) = g_mobileGluesGlslCachePathUtf8;
-    *(char**)(base + kLogPathSlotRva) = g_mobileGluesLogPathUtf8;
-
-    ShimLog("MobileGlues mg_directory_path seeded: %s", mgDir);
-    ShimLog("MobileGlues config_file_path seeded: %s", g_mobileGluesConfigPathUtf8);
-    ShimLog("MobileGlues log_file_path seeded: %s", g_mobileGluesLogPathUtf8);
-    ShimLog("MobileGlues glsl_cache_file_path seeded: %s", g_mobileGluesGlslCachePathUtf8);
-    PatchByte(module, kInitConfigRva, 0xC3, "MobileGlues broken init_config");
-}
-
-static void MakeUtf8Path(char* out, int outCch, const char* dir, const char* leaf) {
-    if (!out || outCch <= 0) return;
-    if (!dir || !*dir) {
-        sprintf_s(out, outCch, "%s", leaf ? leaf : "");
-        return;
-    }
-    if (!leaf || !*leaf) {
-        sprintf_s(out, outCch, "%s", dir);
-        return;
-    }
-    sprintf_s(out, outCch, "%s\\%s", dir, leaf);
-}
-
-static bool PrepareMobileGluesRuntime(HMODULE module) {
-    wchar_t mgDir[MAX_PATH];
-    DWORD len = GetEnvironmentVariableW(L"MG_DIR_PATH", mgDir, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
-        wchar_t runtimeDir[MAX_PATH];
-        GetRuntimeDir(runtimeDir, MAX_PATH);
-        JoinPath(mgDir, MAX_PATH, runtimeDir, L"mobileglues");
-        SetEnvironmentVariableW(L"MG_DIR_PATH", mgDir);
-    }
-
-    CreateDirectoryW(mgDir, nullptr);
-
-    if (!WideToUtf8(mgDir, g_mobileGluesDirUtf8, (int)sizeof(g_mobileGluesDirUtf8))) {
-        ShimLog("Failed to convert MG_DIR_PATH to UTF-8: %S", mgDir);
-        return false;
-    }
-
-    MakeUtf8Path(g_mobileGluesConfigPathUtf8, (int)sizeof(g_mobileGluesConfigPathUtf8),
-        g_mobileGluesDirUtf8, "config.json");
-    MakeUtf8Path(g_mobileGluesLogPathUtf8, (int)sizeof(g_mobileGluesLogPathUtf8),
-        g_mobileGluesDirUtf8, "latest.log");
-    MakeUtf8Path(g_mobileGluesGlslCachePathUtf8, (int)sizeof(g_mobileGluesGlslCachePathUtf8),
-        g_mobileGluesDirUtf8, "glsl_cache.tmp");
-
-    _putenv_s("MG_DIR_PATH", g_mobileGluesDirUtf8);
-    SeedMobileGluesDirectorySlot(module, g_mobileGluesDirUtf8);
-    ShimLog("Prepared MobileGlues runtime dir: %s", g_mobileGluesDirUtf8);
-    return true;
 }
 
 static void GetGraphicsRuntimeName(wchar_t* out, int cch) {
@@ -1204,17 +1062,8 @@ static bool LoadMesaEGL() {
 
     PFN_proc_init procInit = (PFN_proc_init)GetProcAddress(g_opengl32, "proc_init");
     if (procInit) {
-        if (g_graphicsRuntimeUsesGles) {
-            PrepareMobileGluesRuntime(g_opengl32);
-        }
         ShimLog("Calling opengl32!proc_init");
-        DWORD procInitException = 0;
-        __try {
-            procInit();
-        } __except (procInitException = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
-            ShimLog("opengl32!proc_init crashed exception=0x%08X", procInitException);
-            return false;
-        }
+        procInit();
         ShimLog("opengl32!proc_init returned");
     } else if (g_graphicsRuntimeUsesGles) {
         ShimLog("opengl32!proc_init not exported");
