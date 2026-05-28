@@ -1195,6 +1195,45 @@ private:
         d2dContext_->PopAxisAlignedClip();
     }
 
+    void DrawBitmapCover(ID2D1Bitmap1* bitmap, D2D1_RECT_F rect, float opacity, float zoom, float panX, float panY) {
+        if (!bitmap) return;
+
+        const D2D1_SIZE_F size = bitmap->GetSize();
+        const float srcW = size.width;
+        const float srcH = size.height;
+        if (srcW <= 0.0f || srcH <= 0.0f) return;
+
+        const float destW = rect.right - rect.left;
+        const float destH = rect.bottom - rect.top;
+        if (destW <= 0.0f || destH <= 0.0f) return;
+
+        const float destAspect = destW / destH;
+        const float srcAspect = srcW / srcH;
+        float cropW = srcW;
+        float cropH = srcH;
+        if (srcAspect > destAspect) {
+            cropW = srcH * destAspect;
+        } else {
+            cropH = srcW / destAspect;
+        }
+
+        zoom = (std::max)(1.0f, zoom);
+        cropW /= zoom;
+        cropH /= zoom;
+
+        const float maxX = (std::max)(0.0f, (srcW - cropW) * 0.5f);
+        const float maxY = (std::max)(0.0f, (srcH - cropH) * 0.5f);
+        const float centerX = srcW * 0.5f + maxX * (std::max)(-1.0f, (std::min)(1.0f, panX));
+        const float centerY = srcH * 0.5f + maxY * (std::max)(-1.0f, (std::min)(1.0f, panY));
+        const D2D1_RECT_F source = D2D1::RectF(
+            centerX - cropW * 0.5f,
+            centerY - cropH * 0.5f,
+            centerX + cropW * 0.5f,
+            centerY + cropH * 0.5f);
+
+        d2dContext_->DrawBitmap(bitmap, rect, opacity, D2D1_INTERPOLATION_MODE_LINEAR, source);
+    }
+
     void DrawPanorama(D2D1_RECT_F rect, float animation) {
         EnsurePanoramaLoaded();
         if (!panoramaLoaded_) {
@@ -1203,25 +1242,27 @@ private:
         }
 
         d2dContext_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_ALIASED);
-        const float height = rect.bottom - rect.top;
-        const float faceWidth = height;
-        const float stripWidth = faceWidth * 6.0f;
-        float offset = fmodf(animation * 22.0f, stripWidth);
-        if (offset < 0.0f) offset += stripWidth;
 
-        for (int repeat = 0; repeat < 3; ++repeat) {
-            const float repeatStart = rect.left - offset + (repeat - 1) * stripWidth;
-            for (int i = 0; i < 6; ++i) {
-                ID2D1Bitmap1* bitmap = panoramaFaces_[i].Get();
-                if (!bitmap) continue;
-                const D2D1_RECT_F dest = D2D1::RectF(
-                    repeatStart + i * faceWidth,
-                    rect.top,
-                    repeatStart + (i + 1) * faceWidth,
-                    rect.bottom);
-                if (dest.right < rect.left || dest.left > rect.right) continue;
-                d2dContext_->DrawBitmap(bitmap, dest, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
-            }
+        const float segmentSeconds = 7.0f;
+        const float raw = fmodf(animation / segmentSeconds, 6.0f);
+        const int face = static_cast<int>(floorf(raw)) % 6;
+        const int nextFace = (face + 1) % 6;
+        const float phase = raw - floorf(raw);
+        const float fade = phase > 0.82f ? (phase - 0.82f) / 0.18f : 0.0f;
+        const float easedFade = fade * fade * (3.0f - 2.0f * fade);
+        const float panX = sinf(animation * 0.11f) * 0.45f;
+        const float panY = cosf(animation * 0.08f) * 0.18f;
+        const float zoom = 1.08f + 0.025f * sinf(animation * 0.17f);
+
+        DrawBitmapCover(panoramaFaces_[face].Get(), rect, 1.0f, zoom, panX, panY);
+        if (easedFade > 0.0f) {
+            DrawBitmapCover(
+                panoramaFaces_[nextFace].Get(),
+                rect,
+                easedFade,
+                1.08f + 0.025f * sinf((animation + segmentSeconds) * 0.17f),
+                sinf((animation + segmentSeconds) * 0.11f) * 0.45f,
+                cosf((animation + segmentSeconds) * 0.08f) * 0.18f);
         }
 
         if (panoramaOverlay_) {
