@@ -287,6 +287,7 @@ static EGLConfig  g_eglConfig = nullptr;
 static DWORD g_eglContextThreadId = 0;
 static HMODULE g_libEGL = NULL;
 static HMODULE g_opengl32 = NULL;
+static HMODULE g_libGLESv2 = NULL;
 static BOOL g_graphicsRuntimeUsesGles = FALSE;
 static BOOL g_initialised = FALSE;
 static BOOL g_should_close = FALSE;
@@ -1043,7 +1044,10 @@ static bool LoadMesaEGL() {
         RuntimeDllPath(runtimeDir, packagePrefix, dll.file,
             absolutePath, MAX_PATH, packagedPath, MAX_PATH);
         if (GetFileAttributesW(absolutePath) != INVALID_FILE_ATTRIBUTES) {
-            LoadPackagedOrFile(packagedPath, absolutePath, dll.label);
+            HMODULE loaded = LoadPackagedOrFile(packagedPath, absolutePath, dll.label);
+            if (_wcsicmp(dll.file, L"libGLESv2.dll") == 0) {
+                g_libGLESv2 = loaded;
+            }
         }
     }
 
@@ -1591,10 +1595,12 @@ extern "C" __declspec(dllexport) int glfwExtensionSupported(const char* name) {
 extern "C" __declspec(dllexport) void* glfwGetProcAddress(const char* name) {
     void* p = NULL;
     if (g_graphicsRuntimeUsesGles && g_opengl32) p = (void*)GetProcAddress(g_opengl32, name);
+    if (!p && g_graphicsRuntimeUsesGles && g_libGLESv2) p = (void*)GetProcAddress(g_libGLESv2, name);
     if (!p && p_eglGetProcAddress) p = p_eglGetProcAddress(name);
     if (!p && g_opengl32) p = (void*)GetProcAddress(g_opengl32, name);
+    if (!p && g_libGLESv2) p = (void*)GetProcAddress(g_libGLESv2, name);
     if (!p && g_libEGL) p = (void*)GetProcAddress(g_libEGL, name);
-    if (g_proc_log_count < 40) {
+    if (g_proc_log_count < 200) {
         ++g_proc_log_count;
         ShimLog("glfwGetProcAddress #%d %s => %p", g_proc_log_count, name ? name : "(null)", p);
     }
