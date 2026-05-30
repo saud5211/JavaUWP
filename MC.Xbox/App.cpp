@@ -3575,6 +3575,7 @@ static void ShowModsPage(
     bool backWasDown = false;
     bool pageUpWasDown = false;
     bool pageDownWasDown = false;
+    bool wasOskVisible = false;
 
     auto enterSearch = [&]() {
         {
@@ -3694,6 +3695,24 @@ static void ShowModsPage(
 
         const int count = static_cast<int>(state.modsCards.size());
 
+        const bool oskVisible = ModsOnScreenKeyboardVisible();
+        const bool oskFocusRemoved = g_modsEditFocusRemoved.exchange(false);
+        if (state.modsFocus == 1 && ((wasOskVisible && !oskVisible) || oskFocusRemoved)) {
+            commitSearch();
+            ModsSearchEndInput();
+            state.modsFocus = state.modsCards.empty() ? 0 : 2;
+            state.selectedModIndex = 0;
+            state.modsScrollRow = 0;
+        }
+        wasOskVisible = oskVisible;
+        if (oskVisible) {
+            upWasDown = upDown; downWasDown = downDown; leftWasDown = leftDown;
+            rightWasDown = rightDown; selectWasDown = selectDown; enterWasDown = enterDown;
+            backWasDown = backDown; pageUpWasDown = pageUpDown; pageDownWasDown = pageDownDown;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
         if (state.modsFocus == 0) {
             if (upDown && !upWasDown) {
                 state.selectedModsTab = (state.selectedModsTab + 3) % 4;
@@ -3711,20 +3730,26 @@ static void ShowModsPage(
         } else if (state.modsFocus == 1) {
             if (enterDown && !enterWasDown) {
                 commitSearch();
-                state.modsFocus = state.modsCards.empty() ? 1 : 2;
-                state.selectedModIndex = 0;
-                state.modsScrollRow = 0;
+                if (!state.modsCards.empty()) {
+                    ModsSearchEndInput();
+                    state.modsFocus = 2;
+                    state.selectedModIndex = 0;
+                    state.modsScrollRow = 0;
+                }
             }
             if (upDown && !upWasDown) {
                 commitSearch();
+                ModsSearchEndInput();
                 state.modsFocus = 0;
             }
-            if ((leftDown && !leftWasDown)) {
+            if (leftDown && !leftWasDown) {
                 commitSearch();
+                ModsSearchEndInput();
                 state.modsFocus = 0;
             }
             if (downDown && !downWasDown) {
                 commitSearch();
+                ModsSearchEndInput();
                 if (!state.modsCards.empty()) {
                     state.modsFocus = 2;
                     state.selectedModIndex = 0;
