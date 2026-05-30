@@ -17,7 +17,7 @@ output\BanditLauncher_1.0.0.0.appx
 - Python 3 with Pillow.
 - Desktop install of Git `https://git-scm.com/install/windows`
 - Fabric installer JAR at `staging\cache\tools\fabric-installer.jar`.
-- Minecraft native DLLs in `staging\cache\natives-1.21`.
+- Minecraft/LWJGL native DLLs in `staging\cache\natives-1.21`.
 - Mesa UWP runtime DLLs in `mesa-runtime\`, or another folder passed to the build.
 
 Install Pillow:
@@ -53,7 +53,7 @@ For a real version bump, update:
 - `compat_mod/src/main/resources/fabric.mod.json`
 - `MC.Xbox/launch.ps1` if you still use that legacy launch helper
 
-Then recreate the local `gameDir`, assets, natives, remapped jars, and patched Fabric Loader.
+Then recreate the local `gameDir`, natives, remapped jars, and patched Fabric Loader. The installed app downloads official runtime libraries, client jars, and assets into UWP `LocalState`; they are not bundled into the APPX.
 
 ## Mesa runtime
 
@@ -119,10 +119,15 @@ Create the local cache folders and place the Fabric installer here:
 staging\cache\tools\fabric-installer.jar
 ```
 
-Download the Minecraft client libraries and assets for the configured version:
+Download the Minecraft client libraries for the local build cache:
 
 ```powershell
 .\scripts\download-libs.ps1
+```
+
+If you need to regenerate Fabric remapped jars from scratch, also download the local asset cache used by the desktop Fabric launch helper:
+
+```powershell
 .\scripts\download-assets.ps1
 ```
 
@@ -165,6 +170,39 @@ After sign-in, the app exchanges the Microsoft token through Xbox Live, XSTS,
 and Minecraft Services, checks Java Edition ownership, and passes the resolved
 Minecraft username, UUID, and access token into the embedded JVM.
 
+## Runtime downloads
+
+The APPX contains only launcher-owned runtime pieces and intentionally patched
+files:
+
+```text
+MC.Xbox.exe
+jre\
+natives\
+graphics\
+runtime\libraries\...\fabric-loader-<version>.jar
+runtime\bundled-mods\
+runtime\log_configs\
+download_manifest.tsv
+```
+
+It does not contain Mojang libraries, Minecraft client jars, Minecraft version
+JSON files, asset indexes, asset objects, or Fabric remapped jars. During build,
+`scripts\new-download-manifest.ps1` writes `download_manifest.tsv` from official
+Mojang and Fabric metadata. During launch, after ownership verification,
+`MC.Xbox.exe` verifies the manifest entries under `LocalState` and downloads any
+missing or stale files.
+
+Downloaded runtime files land under:
+
+```text
+LocalState\game\libraries
+LocalState\game\versions
+LocalState\assets
+```
+
+The next launch verifies hashes and skips files that are already present.
+
 ## Generate Fabric remapped jars
 
 Fabric remapped jars are created by running the Fabric client once on the local desktop cache. This step is needed before the compatibility mod can compile.
@@ -197,16 +235,17 @@ $javaArgs = @(
 & "$env:JAVA_HOME\bin\java.exe" @javaArgs
 ```
 
-After setup, these paths should exist:
+After setup, these local build-cache paths should exist:
 
 ```text
 staging\cache\gameDir\libraries\net\fabricmc\fabric-loader\0.19.2\fabric-loader-0.19.2.jar
 staging\cache\gameDir\.fabric\remappedJars\minecraft-1.21.11-0.19.2\client-intermediary.jar
-staging\cache\assets\indexes\29.json
 staging\cache\natives-1.21\
 ```
 
-If all of those are there, download Fabric API, Controlify and YetAnotherConfigLib, and put the .jar files into `staging\cache\gameDir\mods`
+If you ran `download-assets.ps1`, `staging\cache\assets\indexes\29.json` should also exist. Runtime assets are still downloaded by the installed app, not copied into the APPX.
+
+If all of those are there, put launcher-owned or explicitly allowed mod jars into `staging\cache\gameDir\mods`. The compatibility mod is generated there automatically by the build.
 
 ## Patch Fabric Loader
 
@@ -217,6 +256,7 @@ The top level build runs this step automatically. You can also run it directly:
 ```
 
 The script overlays patched Fabric Loader classes into the local ignored loader JAR under `staging\cache\gameDir`.
+The package step then copies only that patched loader jar into `runtime\libraries`.
 
 ## Build package
 
@@ -242,8 +282,8 @@ The build script:
 4. Builds the Fabric compatibility mod.
 5. Patches the local Fabric Loader JAR.
 6. Assembles `staging\package`.
-7. Copies Minecraft libraries, versions, Fabric data, assets, natives, bundled mods, Mesa DLLs, and the JRE.
-8. Injects the custom `glfw.dll` into the LWJGL GLFW native JAR.
+7. Copies the patched Fabric Loader, bundled mods, log config, natives, Mesa/MobileGlues graphics DLLs, and the JRE.
+8. Generates `download_manifest.tsv` for official Minecraft/Fabric runtime downloads.
 9. Generates UWP tile and splash assets from `MC.Xbox\Assets\Java_UWP_Icon.png`.
 10. Creates and signs `output\BanditLauncher_1.0.0.0.appx`.
 11. Deletes `staging\package` unless `-KeepStaging` is set.
@@ -286,5 +326,7 @@ To include all ignored files, including downloaded cache files:
 - `Mesa UWP runtime DLLs not found`: pass `-MesaRuntimeDir`, set `MESA_UWP_DIR`, or restore `mesa-runtime\`.
 - Missing `client-intermediary.jar`: run the Fabric client once from the local desktop cache as shown above.
 - Missing native DLLs: fill `staging\cache\natives-1.21` with the native DLLs required by the Minecraft and LWJGL runtime.
+- First launch downloads every required official file after sign-in. A later launch should verify and skip already-downloaded files.
+- Runtime download failure: check `LocalState\mc_launch.log` for the manifest path, URL, HTTP status, or SHA1 mismatch.
 - Package signing failure: delete the ignored local `.pfx` under `staging\certs` and rerun `build.ps1`, or set `APPX_CERT_SUBJECT`.
 - If you can't find your appdata folder, type `%appdata%` into your address bar in your file explorer.

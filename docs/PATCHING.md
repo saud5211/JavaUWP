@@ -18,6 +18,11 @@ Patched classes:
 - `OutputConsumerPath`
 - `FabricLauncherBase`
 
+The patch script copies every compiled `.class` file from the patch output into
+the Fabric Loader JAR. This is intentional: Java sources can generate synthetic
+inner classes such as `OutputConsumerPath$1.class`, and leaving an old inner
+class in the JAR can break Fabric at remap time.
+
 The main goals are:
 
 - Avoid `Path.toRealPath()` in places where the Xbox sandbox blocks or breaks the underlying Windows path query.
@@ -50,7 +55,7 @@ Build it directly with:
 .\compat_mod\build_compat_mod.ps1
 ```
 
-The build copies the mod JAR into the local ignored `gameDir\mods` folder. The top level package step then places bundled mods under `runtime\bundled-mods`, and the UWP host copies them into writable `LocalState` on launch.
+The build copies the mod JAR into the local ignored `gameDir\mods` folder. The top level package step then places bundled launcher-owned mods under `runtime\bundled-mods`, and the UWP host copies them into writable `LocalState\game\mods` on launch.
 
 ## GLFW shim
 
@@ -70,11 +75,11 @@ Build it directly with:
 .\glfw_shim\build_glfw.ps1
 ```
 
-The top level build copies the DLL into package natives and injects it into the LWJGL GLFW native JAR inside the assembled package.
+The top level build copies the DLL into package natives. The JVM launch forces LWJGL to use that DLL with `-Dorg.lwjgl.glfw.libname`, so the package no longer rewrites downloaded LWJGL native jars.
 
 ## Runtime layout
 
-The packaged app keeps immutable runtime files under the package folder. At launch, `MC.Xbox.exe` prepares writable state in `LocalState`:
+The packaged app keeps launcher-owned runtime files under the package folder. At launch, `MC.Xbox.exe` prepares writable state in `LocalState`:
 
 ```text
 LocalState\game
@@ -82,7 +87,7 @@ LocalState\assets
 LocalState\natives
 ```
 
-The game uses `LocalState\game` for saves, config, logs, mods, and other writable files. Bundled compatibility mods are copied there during launch.
+The game uses `LocalState\game` for saves, config, logs, mods, downloaded libraries, downloaded client jars, and other writable files. Bundled compatibility mods are copied there during launch. Mojang libraries, Minecraft client jars, version JSON files, asset indexes, and asset objects are verified from `download_manifest.tsv` and downloaded into `LocalState` after Minecraft ownership verification.
 
 ## Version bumps
 
@@ -91,9 +96,8 @@ When changing Minecraft, Fabric Loader, or key libraries:
 1. Update `scripts/config.ps1`, or pass build overrides while testing.
 2. Update `compat_mod/src/main/resources/fabric.mod.json`.
 3. Recreate `staging\cache\gameDir`.
-4. Recreate `staging\cache\assets`.
-5. Recreate `staging\cache\natives-1.21` if native versions changed.
-6. Run the local Fabric client once so remapped jars are generated.
-7. Run `.\build.ps1`.
+4. Recreate `staging\cache\natives-1.21` if native versions changed.
+5. Run the local Fabric client once so remapped jars are generated.
+6. Run `.\build.ps1`; the build regenerates `download_manifest.tsv` for the selected version.
 
 Do not commit generated game files, downloaded assets, natives, certificates, app packages, logs, or saves.

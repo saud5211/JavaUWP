@@ -13,6 +13,7 @@ The project is usable for active launcher development:
 - The launcher shows a signed-in menu with Play, Mods placeholder, and Sign out.
 - Sign out clears the saved Microsoft refresh token and returns to the device-code sign-in flow.
 - The host skips the LocalState runtime copy on warm launches when the installed package has not changed.
+- The APPX no longer bundles Mojang libraries, Minecraft client jars, asset indexes, or asset objects. It verifies Java ownership, then downloads official files into `LocalState` from the generated `download_manifest.tsv`.
 - Menus render through Mesa on the Xbox GPU.
 - Keyboard and basic text input work.
 - Single player reaches gameplay.
@@ -20,7 +21,7 @@ The project is usable for active launcher development:
 - Xbox controller input is exposed through GameInput in the GLFW shim.
 - The app includes generated UWP tile assets from the checked in icon.
 - The launcher menu can display packaged panorama assets from `MC.Xbox\Assets\panorama`.
-- The host seeds writable game state into `LocalState` when needed.
+- The host seeds launcher-owned support files into `LocalState` when needed.
 
 Expect rough edges. This is still a development launcher, not a finished release product.
 
@@ -47,12 +48,11 @@ Read [docs/BUILDING.md](docs/BUILDING.md) for the complete setup. The short vers
 
 ```powershell
 .\scripts\download-libs.ps1
-.\scripts\download-assets.ps1
 java -jar .\staging\cache\tools\fabric-installer.jar client -dir .\staging\cache\gameDir -mcversion 1.21.11 -loader 0.19.2 -launcher win32 -noprofile
 .\build.ps1
 ```
 
-The build script compiles the UWP host, builds the GLFW shim, builds the compatibility mod, patches the local Fabric Loader JAR, copies launcher assets and runtime files, injects the shim into the LWJGL GLFW native JAR, creates UWP tile assets, then signs `output\BanditLauncher_1.0.0.0.appx`.
+The build script compiles the UWP host, builds the GLFW shim, builds the compatibility mod, patches the local Fabric Loader JAR, generates an official download manifest, copies only launcher-owned runtime files, creates UWP tile assets, then signs `output\BanditLauncher_1.0.0.0.appx`.
 
 Generated files live under `staging` and `output`. They are ignored by git.
 
@@ -60,8 +60,8 @@ Generated files live under `staging` and `output`. They are ignored by git.
 
 You need to provide your own legal game and runtime inputs. This repo does not include:
 
-- Minecraft game files beyond files downloaded into your local ignored cache.
-- Mojang asset objects beyond files downloaded into your local ignored cache.
+- Minecraft game files. Build-time cache files are local only; runtime game files are downloaded by the installed app after ownership verification.
+- Mojang asset objects.
 - Fabric installer JAR.
 - A JRE image committed to git.
 - Signed app packages.
@@ -77,13 +77,14 @@ The Mesa UWP runtime DLLs needed by the build are tracked in `mesa-runtime/`.
 3. If needed, it shows a device-code sign-in screen with a QR code for `microsoft.com/link`.
 4. The launcher verifies Xbox/Minecraft Services ownership and loads the Minecraft profile.
 5. The signed-in menu opens with Play, Mods placeholder, and Sign out.
-6. Play prepares `LocalState` only when the packaged runtime has changed.
-7. The app publishes the live `CoreWindow` through app properties.
-8. The app loads `jvm.dll` and starts Java in the same process.
-9. Fabric launches Minecraft from the embedded JVM.
-10. LWJGL loads the custom `glfw.dll`.
-11. The GLFW shim creates an EGL surface for the UWP window.
-12. Mesa translates OpenGL calls to D3D12.
+6. Play prepares launcher-owned files in `LocalState` only when the packaged runtime has changed.
+7. The app verifies all files from `download_manifest.tsv`, downloading missing or stale official Minecraft/Fabric files into `LocalState`.
+8. The app publishes the live `CoreWindow` through app properties.
+9. The app loads `jvm.dll` and starts Java in the same process.
+10. Fabric launches Minecraft from the embedded JVM.
+11. LWJGL loads the custom `glfw.dll`.
+12. The GLFW shim creates an EGL surface for the UWP window.
+13. Mesa translates OpenGL calls to D3D12.
 
 The main launcher work is around Microsoft auth, ownership verification, UWP package identity, Xbox sandbox paths, packaged app file access, native library loading, GLFW behavior, input, and Fabric remapping.
 
@@ -94,7 +95,7 @@ Known limits include:
 - Xbox Developer Mode is the only supported target.
 - Retail mode is not supported.
 - Mods menu is currently only a placeholder.
-- Runtime/game files are still prepared from local build inputs; dynamic first-run downloading is planned but not complete.
+- First launch can take a while because official game libraries and asset objects are downloaded after sign-in.
 - Path handling is still the most sensitive area.
 - Some Java platform diagnostics can still warn or fail because the sandbox does not look like desktop Windows.
 - Controller support exists through GameInput, but game controls still need testing and tuning.
