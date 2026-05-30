@@ -2603,7 +2603,12 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Xms512M");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
-    const std::wstring javaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";
+    const std::wstring localJavaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";
+    const std::wstring packagedJavaSecurityPatch = packageDir + L"\\java-base-security-realpath.jar";
+    const std::wstring javaSecurityPatch =
+        GetFileAttributesW(localJavaSecurityPatch.c_str()) != INVALID_FILE_ATTRIBUTES
+            ? localJavaSecurityPatch
+            : packagedJavaSecurityPatch;
     if (GetFileAttributesW(javaSecurityPatch.c_str()) != INVALID_FILE_ATTRIBUTES) {
         vmOptionStorage.push_back("--patch-module=java.base=" + w2a(fwd(javaSecurityPatch)));
         WriteLogF(L"Java security realpath patch enabled: %s", javaSecurityPatch.c_str());
@@ -2943,13 +2948,19 @@ public:
         const std::wstring localJreDir = exeDir + L"\\jre";
         const std::wstring packageJreDir = packageDir + L"\\jre";
         const std::wstring jreDir =
-            GetFileAttributesW((localJreDir + L"\\bin\\java.exe").c_str()) != INVALID_FILE_ATTRIBUTES
-                ? localJreDir
-                : packageJreDir;
+            GetFileAttributesW((packageJreDir + L"\\bin\\java.exe").c_str()) != INVALID_FILE_ATTRIBUTES
+                ? packageJreDir
+                : localJreDir;
         const std::wstring gameDir = exeDir + L"\\game";
         const std::wstring javaExe = jreDir + L"\\bin\\java.exe";
         const std::wstring assetsDir = exeDir + L"\\assets";
-        const std::wstring nativesDir = exeDir + L"\\natives";
+        const std::wstring localNativesDir = exeDir + L"\\natives";
+        const std::wstring packageNativesDir = packageDir + L"\\natives";
+        const std::wstring nativesDir =
+            GetFileAttributesW((packageNativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW((packageNativesDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES
+                ? packageNativesDir
+                : localNativesDir;
         const std::wstring minecraftVersion = kMinecraftVersionW;
         const std::wstring packageRuntimeDir = packageDir + L"\\runtime";
         const std::wstring classpathGameDir =
@@ -2968,7 +2979,9 @@ public:
         WriteLogF(L"exeDir: %s", exeDir.c_str());
         WriteLogF(L"jreDir: %s", jreDir.c_str());
         WriteLogF(L"jre release stamp: %s", FileStamp(jreDir + L"\\release").c_str());
+        WriteLogF(L"local jre release stamp: %s", FileStamp(localJreDir + L"\\release").c_str());
         WriteLogF(L"package jre release stamp: %s", FileStamp(packageJreDir + L"\\release").c_str());
+        WriteLogF(L"nativesDir: %s", nativesDir.c_str());
         WriteLogF(L"classpathGameDir: %s", classpathGameDir.c_str());
         WriteLogF(L"bundledModsDir: %s", bundledModsDir.c_str());
         WriteLogF(L"userModsDir: %s", userModsDir.c_str());
