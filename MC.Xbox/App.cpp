@@ -49,6 +49,8 @@
 #include <winrt/Windows.Web.Http.h>
 #include <winrt/Windows.Web.Http.Headers.h>
 #include <winrt/Windows.UI.Core.h>
+#include <winrt/Windows.UI.Text.Core.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 
 #include "runtime_config.h"
 #include "qr_code.h"
@@ -1573,8 +1575,10 @@ struct ModCard {
 
 static std::mutex g_modsSearchMutex;
 static std::wstring g_modsSearchBuffer;
+static int g_modsCaret = 0;
 static bool g_modsSearchDirty = false;
 static std::atomic<bool> g_modsSearchCapturing{false};
+static std::atomic<bool> g_modsEditFocusRemoved{false};
 
 // render computes how many card rows fit; the input loop reads this to keep the
 // selection on screen without duplicating the layout math
@@ -2589,11 +2593,11 @@ public:
             const float top = frame.top + 34.0f;
             const float buttonH = 58.0f;
             const float buttonGap = 22.0f;
-            const wchar_t* tabs[] = { L"Installed", L"Popular", L"Latest" };
+            const wchar_t* tabs[] = { L"Installed", L"Popular", L"Latest", L"Recommended" };
 
             DrawText(L"Mods", bodyFormat_.Get(), D2D1::RectF(left, top, tabsRight, top + 42.0f), white.Get());
 
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < 4; ++i) {
                 const float y = top + 76.0f + i * (buttonH + buttonGap);
                 const D2D1_RECT_F tab = D2D1::RectF(left, y, tabsRight, y + buttonH);
                 const bool selected = i == state.selectedModsTab && state.modsFocus == 0;
@@ -3217,6 +3221,71 @@ static bool AnyVirtualKeyDown(ICoreWindow* window, std::initializer_list<ABI::Wi
     return false;
 }
 
+static const wchar_t* kRecommendedSlugs[] = {
+    L"sodium", L"modernfix", L"ferrite-core", L"c2me-fabric", L"scalablelux",
+    L"asyncparticles", L"controlify", L"mcwifipnp", L"fpsdisplay", L"modmenu"
+};
+
+static bool FetchRecommendedMods(const std::wstring& runtimeRoot, std::vector<ModCard>& out, std::wstring& error) {
+    using namespace winrt::Windows::Data::Json;
+    error.clear();
+
+    std::string ids = "[";
+    bool first = true;
+    for (const wchar_t* slug : kRecommendedSlugs) {
+        if (!first) ids += ",";
+        first = false;
+        ids += "\"" + w2a(slug) + "\"";
+    }
+    ids += "]";
+
+    const std::wstring url = L"https://api.modrinth.com/v2/projects?ids=" + a2w(FormUrlEncode(ids).c_str());
+    const HttpResult response = HttpGetString(url.c_str());
+    if (!response.success()) {
+        error = L"Recommended fetch failed HTTP " + std::to_wstring(response.status);
+        return false;
+    }
+
+    std::map<std::wstring, ModCard> bySlug;
+    try {
+        JsonArray arr = JsonArray::Parse(winrt::to_hstring(response.body));
+        for (uint32_t i = 0; i < arr.Size(); ++i) {
+            auto value = arr.GetAt(i);
+            if (value.ValueType() != JsonValueType::Object) continue;
+            JsonObject project = value.GetObject();
+
+            ModCard card;
+            card.projectId = JsonStringOrEmpty(project, L"id");
+            card.slug = JsonStringOrEmpty(project, L"slug");
+            card.title = JsonStringOrEmpty(project, L"title");
+            card.description = JsonStringOrEmpty(project, L"description");
+            const std::wstring iconUrl = JsonStringOrEmpty(project, L"icon_url");
+            if (card.title.empty()) card.title = card.slug.empty() ? card.projectId : card.slug;
+            card.status = std::to_wstring(JsonIntOrZero(project, L"downloads")) + L" downloads";
+            if (!iconUrl.empty()) {
+                card.iconUrl = iconUrl;
+                card.iconPath = ModIconCachePath(runtimeRoot, card.projectId.empty() ? card.slug : card.projectId);
+            }
+            std::wstring key = card.slug;
+            std::transform(key.begin(), key.end(), key.begin(),
+                [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+            bySlug[key] = card;
+        }
+    } catch (...) {
+        error = L"Could not parse recommended response";
+        return false;
+    }
+
+    for (const wchar_t* slug : kRecommendedSlugs) {
+        std::wstring key = slug;
+        std::transform(key.begin(), key.end(), key.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+        auto it = bySlug.find(key);
+        if (it != bySlug.end()) out.push_back(it->second);
+    }
+    return true;
+}
+
 static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, const std::wstring& userModsDir) {
     state.modsCards.clear();
     state.selectedModIndex = 0;
@@ -3251,7 +3320,37 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
         return;
     }
 
-    const char* index = state.selectedModsTab == 1 ? "downloads" : "newest";
+    if (state.selectedModsTab == 3) {
+        std::vector<ModCard> all;
+        std::wstring error;
+        if (!FetchRecommendedMods(runtimeRoot, all, error)) {
+            state.status = error.empty() ? L"Could not load recommended" : error;
+            state.isError = true;
+            return;
+        }
+        if (query.empty()) {
+            state.modsCards = std::move(all);
+        } else {
+            std::wstring lowerNeedle = query;
+            std::transform(lowerNeedle.begin(), lowerNeedle.end(), lowerNeedle.begin(),
+                [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+            for (auto& card : all) {
+                std::wstring hay = card.title + L" " + card.slug;
+                std::transform(hay.begin(), hay.end(), hay.begin(),
+                    [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+                if (hay.find(lowerNeedle) != std::wstring::npos) {
+                    state.modsCards.push_back(std::move(card));
+                }
+            }
+        }
+        QueueModIcons(state.modsCards);
+        state.status = state.modsCards.empty()
+            ? L"No recommended mods"
+            : std::to_wstring(state.modsCards.size()) + L" recommended";
+        return;
+    }
+
+    const char* index = !query.empty() ? "relevance" : (state.selectedModsTab == 1 ? "downloads" : "newest");
     std::wstring error;
     int total = 0;
     if (!FetchModrinthMods(runtimeRoot, index, query, 0, kModPageSize, state.modsCards, total, error)) {
@@ -3270,13 +3369,22 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
 
 static winrt::Windows::UI::Core::CoreWindow g_modsCharWindow{nullptr};
 static winrt::event_token g_modsCharToken{};
+static bool g_modsCharRegistered = false;
 
-static void BeginModsSearchCapture(ICoreWindow* window) {
-    if (g_modsCharWindow) return;
+static winrt::Windows::UI::Text::Core::CoreTextEditContext g_editContext{nullptr};
+static winrt::Windows::UI::ViewManagement::InputPane g_inputPane{nullptr};
+static winrt::event_token g_ecTextRequested{};
+static winrt::event_token g_ecSelectionRequested{};
+static winrt::event_token g_ecTextUpdating{};
+static winrt::event_token g_ecSelectionUpdating{};
+static winrt::event_token g_ecLayoutRequested{};
+static winrt::event_token g_ecFocusRemoved{};
+static bool g_modsUsingEditContext = false;
+
+static void RegisterCharacterFallback() {
+    if (!g_modsCharWindow || g_modsCharRegistered) return;
     try {
-        winrt::Windows::UI::Core::CoreWindow w{nullptr};
-        winrt::copy_from_abi(w, window);
-        g_modsCharToken = w.CharacterReceived(
+        g_modsCharToken = g_modsCharWindow.CharacterReceived(
             [](winrt::Windows::UI::Core::CoreWindow const&,
                winrt::Windows::UI::Core::CharacterReceivedEventArgs const& args) {
                 if (!g_modsSearchCapturing.load()) return;
@@ -3292,21 +3400,149 @@ static void BeginModsSearchCapture(ICoreWindow* window) {
                     g_modsSearchDirty = true;
                 }
             });
-        g_modsCharWindow = w;
+        g_modsCharRegistered = true;
     } catch (...) {
+    }
+}
+
+static void CreateModsEditContext() {
+    using namespace winrt::Windows::UI::Text::Core;
+    try {
+        auto manager = CoreTextServicesManager::GetForCurrentView();
+        g_editContext = manager.CreateEditContext();
+        g_editContext.InputPaneDisplayPolicy(CoreTextInputPaneDisplayPolicy::Manual);
+        g_editContext.InputScope(CoreTextInputScope::Search);
+
+        g_ecTextRequested = g_editContext.TextRequested(
+            [](auto&&, CoreTextTextRequestedEventArgs const& args) {
+                auto request = args.Request();
+                auto range = request.Range();
+                std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+                const int len = static_cast<int>(g_modsSearchBuffer.size());
+                const int s = (std::max)(0, (std::min)(range.StartCaretPosition, len));
+                const int e = (std::max)(s, (std::min)(range.EndCaretPosition, len));
+                request.Text(winrt::hstring(std::wstring_view(g_modsSearchBuffer).substr(s, e - s)));
+            });
+
+        g_ecSelectionRequested = g_editContext.SelectionRequested(
+            [](auto&&, CoreTextSelectionRequestedEventArgs const& args) {
+                CoreTextRange r{ g_modsCaret, g_modsCaret };
+                args.Request().Selection(r);
+            });
+
+        g_ecTextUpdating = g_editContext.TextUpdating(
+            [](auto&&, CoreTextTextUpdatingEventArgs const& args) {
+                const auto range = args.Range();
+                std::wstring incoming;
+                for (wchar_t c : std::wstring_view(args.Text())) {
+                    if (c != L'\r' && c != L'\n' && c != L'\t') incoming.push_back(c);
+                }
+                std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+                const int len = static_cast<int>(g_modsSearchBuffer.size());
+                const int s = (std::max)(0, (std::min)(range.StartCaretPosition, len));
+                const int e = (std::max)(s, (std::min)(range.EndCaretPosition, len));
+                g_modsSearchBuffer = g_modsSearchBuffer.substr(0, s) + incoming + g_modsSearchBuffer.substr(e);
+                if (g_modsSearchBuffer.size() > 64) g_modsSearchBuffer.resize(64);
+                g_modsCaret = (std::min)(s + static_cast<int>(incoming.size()), static_cast<int>(g_modsSearchBuffer.size()));
+                g_modsSearchDirty = true;
+                args.Result(CoreTextTextUpdatingResult::Succeeded);
+            });
+
+        g_ecSelectionUpdating = g_editContext.SelectionUpdating(
+            [](auto&&, CoreTextSelectionUpdatingEventArgs const& args) {
+                g_modsCaret = args.Selection().EndCaretPosition;
+                args.Result(CoreTextSelectionUpdatingResult::Succeeded);
+            });
+
+        g_ecLayoutRequested = g_editContext.LayoutRequested(
+            [](auto&&, CoreTextLayoutRequestedEventArgs const& args) {
+                winrt::Windows::Foundation::Rect rect{ 0.0f, 0.0f, 1.0f, 1.0f };
+                if (g_modsCharWindow) rect = g_modsCharWindow.Bounds();
+                auto bounds = args.Request().LayoutBounds();
+                bounds.TextBounds(rect);
+                bounds.ControlBounds(rect);
+            });
+
+        g_ecFocusRemoved = g_editContext.FocusRemoved(
+            [](auto&&, auto&&) { g_modsEditFocusRemoved.store(true); });
+
+        try { g_inputPane = winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView(); } catch (...) {}
+        g_modsUsingEditContext = true;
+    } catch (...) {
+        g_editContext = nullptr;
+        g_modsUsingEditContext = false;
+    }
+}
+
+static void BeginModsSearchCapture(ICoreWindow* window) {
+    if (!g_modsCharWindow) {
+        try {
+            winrt::Windows::UI::Core::CoreWindow w{ nullptr };
+            winrt::copy_from_abi(w, window);
+            g_modsCharWindow = w;
+        } catch (...) {
+        }
+    }
+    CreateModsEditContext();
+    if (!g_modsUsingEditContext) {
+        RegisterCharacterFallback();
     }
 }
 
 static void EndModsSearchCapture() {
     g_modsSearchCapturing.store(false);
-    if (g_modsCharWindow) {
-        try { g_modsCharWindow.CharacterReceived(g_modsCharToken); } catch (...) {}
-        g_modsCharWindow = nullptr;
-        g_modsCharToken = {};
+    if (g_modsUsingEditContext && g_editContext) {
+        try { g_editContext.NotifyFocusLeave(); } catch (...) {}
+        if (g_inputPane) { try { g_inputPane.TryHide(); } catch (...) {} }
+        try {
+            g_editContext.TextRequested(g_ecTextRequested);
+            g_editContext.SelectionRequested(g_ecSelectionRequested);
+            g_editContext.TextUpdating(g_ecTextUpdating);
+            g_editContext.SelectionUpdating(g_ecSelectionUpdating);
+            g_editContext.LayoutRequested(g_ecLayoutRequested);
+            g_editContext.FocusRemoved(g_ecFocusRemoved);
+        } catch (...) {}
     }
+    g_editContext = nullptr;
+    g_inputPane = nullptr;
+    g_modsUsingEditContext = false;
+
+    if (g_modsCharRegistered && g_modsCharWindow) {
+        try { g_modsCharWindow.CharacterReceived(g_modsCharToken); } catch (...) {}
+    }
+    g_modsCharRegistered = false;
+    g_modsCharToken = {};
+    g_modsCharWindow = nullptr;
+
     std::lock_guard<std::mutex> lk(g_modsSearchMutex);
     g_modsSearchBuffer.clear();
+    g_modsCaret = 0;
     g_modsSearchDirty = false;
+}
+
+static void ModsSearchBeginInput() {
+    g_modsEditFocusRemoved.store(false);
+    if (g_modsUsingEditContext && g_editContext) {
+        { std::lock_guard<std::mutex> lk(g_modsSearchMutex); g_modsCaret = static_cast<int>(g_modsSearchBuffer.size()); }
+        try { g_editContext.NotifyFocusEnter(); } catch (...) {}
+        if (g_inputPane) { try { g_inputPane.TryShow(); } catch (...) {} }
+    } else {
+        g_modsSearchCapturing.store(true);
+    }
+}
+
+static void ModsSearchEndInput() {
+    if (g_modsUsingEditContext && g_editContext) {
+        try { g_editContext.NotifyFocusLeave(); } catch (...) {}
+        if (g_inputPane) { try { g_inputPane.TryHide(); } catch (...) {} }
+    } else {
+        g_modsSearchCapturing.store(false);
+    }
+}
+
+static bool ModsOnScreenKeyboardVisible() {
+    if (!g_modsUsingEditContext || !g_inputPane) return false;
+    try { return g_inputPane.Visible(); } catch (...) { return false; }
 }
 
 static void ShowModsPage(
@@ -3341,10 +3577,13 @@ static void ShowModsPage(
     bool pageDownWasDown = false;
 
     auto enterSearch = [&]() {
-        std::lock_guard<std::mutex> lk(g_modsSearchMutex);
-        g_modsSearchBuffer = state.modsSearchQuery;
-        g_modsSearchDirty = false;
+        {
+            std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+            g_modsSearchBuffer = state.modsSearchQuery;
+            g_modsSearchDirty = false;
+        }
         state.modsFocus = 1;
+        ModsSearchBeginInput();
     };
 
     auto commitSearch = [&]() {
@@ -3369,8 +3608,9 @@ static void ShowModsPage(
     };
 
     auto loadMore = [&]() {
-        if (state.modsExhausted || state.selectedModsTab == 0) return;
-        const char* index = state.selectedModsTab == 1 ? "downloads" : "newest";
+        const bool browseTab = state.selectedModsTab == 1 || state.selectedModsTab == 2;
+        if (state.modsExhausted || !browseTab) return;
+        const char* index = !state.modsSearchQuery.empty() ? "relevance" : (state.selectedModsTab == 1 ? "downloads" : "newest");
         const int before = static_cast<int>(state.modsCards.size());
         state.status = L"Loading more...";
         RenderAuth(renderer, state);
@@ -3456,12 +3696,12 @@ static void ShowModsPage(
 
         if (state.modsFocus == 0) {
             if (upDown && !upWasDown) {
-                state.selectedModsTab = (state.selectedModsTab + 2) % 3;
+                state.selectedModsTab = (state.selectedModsTab + 3) % 4;
                 LoadModsTab(state, runtimeRoot, userModsDir);
                 loadedQuery = state.modsSearchQuery;
             }
             if (downDown && !downWasDown) {
-                state.selectedModsTab = (state.selectedModsTab + 1) % 3;
+                state.selectedModsTab = (state.selectedModsTab + 1) % 4;
                 LoadModsTab(state, runtimeRoot, userModsDir);
                 loadedQuery = state.modsSearchQuery;
             }
@@ -3523,7 +3763,7 @@ static void ShowModsPage(
                 state.selectedModIndex = (std::max)(state.selectedModIndex - step, 0);
             }
 
-            if (!state.modsExhausted && state.selectedModsTab != 0 && count > 0 &&
+            if (!state.modsExhausted && (state.selectedModsTab == 1 || state.selectedModsTab == 2) && count > 0 &&
                 ((downDown && !downWasDown) || (pageDownDown && !pageDownWasDown))) {
                 const int lastRow = (count - 1) / 2;
                 if (state.selectedModIndex / 2 >= lastRow) {
