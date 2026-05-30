@@ -22,13 +22,13 @@ function Get-SafeFileName {
 }
 
 function Get-MinecraftVersionJson {
-    $manifest = Invoke-WebRequest -Uri "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" | ConvertFrom-Json
+    $manifest = Invoke-WebRequest -UseBasicParsing -Uri "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" | ConvertFrom-Json
     $entry = $manifest.versions | Where-Object { $_.id -eq $version } | Select-Object -First 1
     if (-not $entry) {
         throw "Minecraft version $version not found in Mojang manifest."
     }
 
-    return Invoke-WebRequest -Uri $entry.url | ConvertFrom-Json
+    return Invoke-WebRequest -UseBasicParsing -Uri $entry.url | ConvertFrom-Json
 }
 
 function Save-RemoteFile {
@@ -42,7 +42,7 @@ function Save-RemoteFile {
     }
 
     New-Item -ItemType Directory -Force -Path (Split-Path $Path -Parent) | Out-Null
-    Invoke-WebRequest -Uri $Uri -OutFile $Path
+    Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Path
 }
 
 function Expand-NativeJar {
@@ -125,7 +125,7 @@ if (-not $nativeDlls) {
 }
 
 Write-Host "=== Downloading Fabric installer ==="
-$fabricMetadata = [xml](Invoke-WebRequest -Uri "https://maven.fabricmc.net/net/fabricmc/fabric-installer/maven-metadata.xml").Content
+$fabricMetadata = [xml](Invoke-WebRequest -UseBasicParsing -Uri "https://maven.fabricmc.net/net/fabricmc/fabric-installer/maven-metadata.xml").Content
 $installerVersion = $fabricMetadata.metadata.versioning.release
 if (-not $installerVersion) {
     $installerVersion = $fabricMetadata.metadata.versioning.latest

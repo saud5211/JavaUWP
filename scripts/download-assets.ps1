@@ -11,18 +11,18 @@ New-Item -ItemType Directory -Force -Path "$assetsDir\indexes" | Out-Null
 New-Item -ItemType Directory -Force -Path "$assetsDir\objects" | Out-Null
 
 # Get version json to find asset index
-$manifest = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json' | ConvertFrom-Json
+$manifest = Invoke-WebRequest -UseBasicParsing -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json' | ConvertFrom-Json
 $v = $manifest.versions | Where-Object { $_.id -eq $version } | Select-Object -First 1
 if (-not $v) {
     throw "Minecraft version $version not found in manifest."
 }
-$vj = Invoke-WebRequest -Uri $v.url | ConvertFrom-Json
+$vj = Invoke-WebRequest -UseBasicParsing -Uri $v.url | ConvertFrom-Json
 
 # Download asset index
 $assetIndexUrl = $vj.assetIndex.url
 $assetIndexId = $vj.assetIndex.id
 Write-Host "Downloading asset index: $assetIndexId"
-Invoke-WebRequest -Uri $assetIndexUrl -OutFile "$assetsDir\indexes\$assetIndexId.json"
+Invoke-WebRequest -UseBasicParsing -Uri $assetIndexUrl -OutFile "$assetsDir\indexes\$assetIndexId.json"
 
 # Download all assets
 $index = Get-Content "$assetsDir\indexes\$assetIndexId.json" | ConvertFrom-Json
@@ -38,7 +38,7 @@ foreach ($obj in $objects) {
     New-Item -ItemType Directory -Force -Path $destDir | Out-Null
     if (-not (Test-Path $dest)) {
         $url = "https://resources.download.minecraft.net/$subdir/$hash"
-        Invoke-WebRequest -Uri $url -OutFile $dest
+        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest
     }
     $i++
     if ($i % 100 -eq 0) { Write-Host "$i / $total assets downloaded" }
