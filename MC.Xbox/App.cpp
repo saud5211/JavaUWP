@@ -51,6 +51,7 @@
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Text.Core.h>
 #include <winrt/Windows.UI.ViewManagement.h>
+#include <winrt/Windows.System.h>
 
 #include "runtime_config.h"
 #include "qr_code.h"
@@ -1579,6 +1580,7 @@ static int g_modsCaret = 0;
 static bool g_modsSearchDirty = false;
 static std::atomic<bool> g_modsSearchCapturing{false};
 static std::atomic<bool> g_modsEditFocusRemoved{false};
+static std::atomic<bool> g_modsSearchSubmit{false};
 
 // render computes how many card rows fit; the input loop reads this to keep the
 // selection on screen without duplicating the layout math
@@ -2379,6 +2381,7 @@ struct AuthUiState {
     int modsScrollRow = 0;
     int modsTotalHits = 0;
     bool modsExhausted = false;
+    bool modsSearchEditing = false;
     std::wstring modsSearchQuery;
     std::vector<ModCard> modsCards;
     float animation = 0.0f;
@@ -2631,9 +2634,9 @@ public:
             }
             d2dContext_->DrawRectangle(search, searchFocused ? accent.Get() : white.Get(), searchFocused ? 4.0f : 2.0f);
             {
-                const bool placeholder = state.modsSearchQuery.empty() && !searchFocused;
+                const bool placeholder = state.modsSearchQuery.empty() && !state.modsSearchEditing;
                 std::wstring shown = placeholder ? std::wstring(L"Search mods") : state.modsSearchQuery;
-                if (searchFocused) shown += L"_";
+                if (state.modsSearchEditing) shown += L"_";
                 DrawText(shown.c_str(), smallFormat_.Get(),
                     D2D1::RectF(search.left + 14.0f, search.top + 11.0f, search.right - 12.0f, search.bottom - 8.0f),
                     placeholder ? muted.Get() : white.Get());
@@ -3379,6 +3382,8 @@ static winrt::event_token g_ecTextUpdating{};
 static winrt::event_token g_ecSelectionUpdating{};
 static winrt::event_token g_ecLayoutRequested{};
 static winrt::event_token g_ecFocusRemoved{};
+static winrt::event_token g_modsKeyDownToken{};
+static bool g_modsKeyDownRegistered = false;
 static bool g_modsUsingEditContext = false;
 
 static void RegisterCharacterFallback() {
@@ -3433,18 +3438,26 @@ static void CreateModsEditContext() {
         g_ecTextUpdating = g_editContext.TextUpdating(
             [](auto&&, CoreTextTextUpdatingEventArgs const& args) {
                 const auto range = args.Range();
+                bool sawNewline = false;
                 std::wstring incoming;
                 for (wchar_t c : std::wstring_view(args.Text())) {
-                    if (c != L'\r' && c != L'\n' && c != L'\t') incoming.push_back(c);
+                    if (c == L'\r' || c == L'\n') { sawNewline = true; continue; }
+                    if (c == L'\t') continue;
+                    incoming.push_back(c);
                 }
-                std::lock_guard<std::mutex> lk(g_modsSearchMutex);
-                const int len = static_cast<int>(g_modsSearchBuffer.size());
-                const int s = (std::max)(0, (std::min)(range.StartCaretPosition, len));
-                const int e = (std::max)(s, (std::min)(range.EndCaretPosition, len));
-                g_modsSearchBuffer = g_modsSearchBuffer.substr(0, s) + incoming + g_modsSearchBuffer.substr(e);
-                if (g_modsSearchBuffer.size() > 64) g_modsSearchBuffer.resize(64);
-                g_modsCaret = (std::min)(s + static_cast<int>(incoming.size()), static_cast<int>(g_modsSearchBuffer.size()));
-                g_modsSearchDirty = true;
+                {
+                    std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+                    const int len = static_cast<int>(g_modsSearchBuffer.size());
+                    const int s = (std::max)(0, (std::min)(range.StartCaretPosition, len));
+                    const int e = (std::max)(s, (std::min)(range.EndCaretPosition, len));
+                    g_modsSearchBuffer = g_modsSearchBuffer.substr(0, s) + incoming + g_modsSearchBuffer.substr(e);
+                    if (g_modsSearchBuffer.size() > 64) g_modsSearchBuffer.resize(64);
+                    const int newLen = static_cast<int>(g_modsSearchBuffer.size());
+                    const auto sel = args.NewSelection();
+                    g_modsCaret = (std::max)(0, (std::min)(sel.EndCaretPosition, newLen));
+                    g_modsSearchDirty = true;
+                }
+                if (sawNewline) g_modsSearchSubmit.store(true);
                 args.Result(CoreTextTextUpdatingResult::Succeeded);
             });
 
@@ -3465,6 +3478,44 @@ static void CreateModsEditContext() {
 
         g_ecFocusRemoved = g_editContext.FocusRemoved(
             [](auto&&, auto&&) { g_modsEditFocusRemoved.store(true); });
+
+        // the Xbox on-screen keyboard delivers Backspace/Enter as key events rather
+        // than through the edit context, so catch them here and keep the context in sync
+        if (g_modsCharWindow) {
+            g_modsKeyDownToken = g_modsCharWindow.KeyDown(
+                [](winrt::Windows::UI::Core::CoreWindow const&,
+                   winrt::Windows::UI::Core::KeyEventArgs const& args) {
+                    if (!g_modsSearchCapturing.load()) return;
+                    const auto vk = args.VirtualKey();
+                    if (vk == winrt::Windows::System::VirtualKey::Back) {
+                        int newCaret = 0;
+                        bool changed = false;
+                        {
+                            std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+                            int caret = (std::max)(0, (std::min)(g_modsCaret, static_cast<int>(g_modsSearchBuffer.size())));
+                            if (caret > 0) {
+                                g_modsSearchBuffer.erase(caret - 1, 1);
+                                g_modsCaret = caret - 1;
+                                newCaret = g_modsCaret;
+                                changed = true;
+                                g_modsSearchDirty = true;
+                            }
+                        }
+                        if (changed && g_editContext) {
+                            try {
+                                using namespace winrt::Windows::UI::Text::Core;
+                                g_editContext.NotifyTextChanged(CoreTextRange{ newCaret, newCaret + 1 }, 0, CoreTextRange{ newCaret, newCaret });
+                                g_editContext.NotifySelectionChanged(CoreTextRange{ newCaret, newCaret });
+                            } catch (...) {}
+                        }
+                        args.Handled(true);
+                    } else if (vk == winrt::Windows::System::VirtualKey::Enter) {
+                        g_modsSearchSubmit.store(true);
+                        args.Handled(true);
+                    }
+                });
+            g_modsKeyDownRegistered = true;
+        }
 
         try { g_inputPane = winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView(); } catch (...) {}
         g_modsUsingEditContext = true;
@@ -3507,6 +3558,12 @@ static void EndModsSearchCapture() {
     g_inputPane = nullptr;
     g_modsUsingEditContext = false;
 
+    if (g_modsKeyDownRegistered && g_modsCharWindow) {
+        try { g_modsCharWindow.KeyDown(g_modsKeyDownToken); } catch (...) {}
+    }
+    g_modsKeyDownRegistered = false;
+    g_modsKeyDownToken = {};
+
     if (g_modsCharRegistered && g_modsCharWindow) {
         try { g_modsCharWindow.CharacterReceived(g_modsCharToken); } catch (...) {}
     }
@@ -3522,9 +3579,16 @@ static void EndModsSearchCapture() {
 
 static void ModsSearchBeginInput() {
     g_modsEditFocusRemoved.store(false);
+    g_modsSearchSubmit.store(false);
     if (g_modsUsingEditContext && g_editContext) {
-        { std::lock_guard<std::mutex> lk(g_modsSearchMutex); g_modsCaret = static_cast<int>(g_modsSearchBuffer.size()); }
-        try { g_editContext.NotifyFocusEnter(); } catch (...) {}
+        int len = 0;
+        { std::lock_guard<std::mutex> lk(g_modsSearchMutex); g_modsCaret = static_cast<int>(g_modsSearchBuffer.size()); len = g_modsCaret; }
+        try {
+            using namespace winrt::Windows::UI::Text::Core;
+            g_editContext.NotifyFocusEnter();
+            g_editContext.NotifyTextChanged(CoreTextRange{ 0, 0 }, len, CoreTextRange{ len, len });
+            g_editContext.NotifySelectionChanged(CoreTextRange{ len, len });
+        } catch (...) {}
         if (g_inputPane) { try { g_inputPane.TryShow(); } catch (...) {} }
     } else {
         g_modsSearchCapturing.store(true);
@@ -3558,6 +3622,7 @@ static void ShowModsPage(
     state.selectedModIndex = 0;
     state.modsFocus = 0;
     state.modsScrollRow = 0;
+    state.modsSearchEditing = false;
     state.modsSearchQuery.clear();
     state.status = L"Loading installed mods";
     LoadModsTab(state, runtimeRoot, userModsDir);
@@ -3584,7 +3649,7 @@ static void ShowModsPage(
             g_modsSearchDirty = false;
         }
         state.modsFocus = 1;
-        ModsSearchBeginInput();
+        state.modsSearchEditing = false;
     };
 
     auto commitSearch = [&]() {
@@ -3631,8 +3696,8 @@ static void ShowModsPage(
 
     WriteLog(L"Mods page opened");
     while (true) {
-        g_modsSearchCapturing.store(state.modsFocus == 1);
-        if (state.modsFocus == 1) {
+        g_modsSearchCapturing.store(state.modsSearchEditing);
+        if (state.modsSearchEditing) {
             std::lock_guard<std::mutex> lk(g_modsSearchMutex);
             state.modsSearchQuery = g_modsSearchBuffer;
         }
@@ -3697,9 +3762,12 @@ static void ShowModsPage(
 
         const bool oskVisible = ModsOnScreenKeyboardVisible();
         const bool oskFocusRemoved = g_modsEditFocusRemoved.exchange(false);
-        if (state.modsFocus == 1 && ((wasOskVisible && !oskVisible) || oskFocusRemoved)) {
+        const bool submitRequested = g_modsSearchSubmit.exchange(false);
+        if (state.modsFocus == 1 && state.modsSearchEditing &&
+            (submitRequested || (wasOskVisible && !oskVisible) || oskFocusRemoved)) {
             commitSearch();
             ModsSearchEndInput();
+            state.modsSearchEditing = false;
             state.modsFocus = state.modsCards.empty() ? 0 : 2;
             state.selectedModIndex = 0;
             state.modsScrollRow = 0;
@@ -3728,34 +3796,43 @@ static void ShowModsPage(
                 enterSearch();
             }
         } else if (state.modsFocus == 1) {
-            if (enterDown && !enterWasDown) {
-                commitSearch();
-                if (!state.modsCards.empty()) {
-                    ModsSearchEndInput();
-                    state.modsFocus = 2;
-                    state.selectedModIndex = 0;
-                    state.modsScrollRow = 0;
-                }
-            }
-            if (upDown && !upWasDown) {
-                commitSearch();
-                ModsSearchEndInput();
-                state.modsFocus = 0;
-            }
-            if (leftDown && !leftWasDown) {
-                commitSearch();
-                ModsSearchEndInput();
-                state.modsFocus = 0;
-            }
-            if (downDown && !downWasDown) {
-                commitSearch();
-                ModsSearchEndInput();
-                if (!state.modsCards.empty()) {
-                    state.modsFocus = 2;
-                    state.selectedModIndex = 0;
-                    state.modsScrollRow = 0;
-                } else {
+            if (!state.modsSearchEditing) {
+                if ((selectDown && !selectWasDown) || (enterDown && !enterWasDown)) {
+                    state.modsSearchEditing = true;
+                    ModsSearchBeginInput();
+                } else if ((upDown && !upWasDown) || (leftDown && !leftWasDown)) {
                     state.modsFocus = 0;
+                } else if (downDown && !downWasDown) {
+                    if (!state.modsCards.empty()) {
+                        state.modsFocus = 2;
+                        state.selectedModIndex = 0;
+                        state.modsScrollRow = 0;
+                    } else {
+                        state.modsFocus = 0;
+                    }
+                }
+            } else {
+                bool leaving = false;
+                int nextFocus = 1;
+                if (enterDown && !enterWasDown) {
+                    leaving = true;
+                    nextFocus = state.modsCards.empty() ? 1 : 2;
+                } else if ((upDown && !upWasDown) || (leftDown && !leftWasDown)) {
+                    leaving = true;
+                    nextFocus = 0;
+                } else if (downDown && !downWasDown) {
+                    leaving = true;
+                    nextFocus = state.modsCards.empty() ? 0 : 2;
+                }
+                if (leaving) {
+                    commitSearch();
+                    ModsSearchEndInput();
+                    state.modsSearchEditing = false;
+                    state.modsFocus = nextFocus;
+                    if (nextFocus == 2) {
+                        state.selectedModIndex = 0;
+                        state.modsScrollRow = 0;
+                    }
                 }
             }
         } else {
