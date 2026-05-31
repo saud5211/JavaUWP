@@ -94,6 +94,8 @@ static bool g_coreWindowLifecycleHooksInstalled = false;
 static volatile LONG g_logTailerRunning = 0;
 static HANDLE g_logTailerThreads[8] = {};
 static int g_logTailerThreadCount = 0;
+static HANDLE g_redirectedStdoutHandle = INVALID_HANDLE_VALUE;
+static HANDLE g_redirectedStderrHandle = INVALID_HANDLE_VALUE;
 static constexpr wchar_t kEGLNativeWindowTypeProperty[] = L"EGLNativeWindowTypeProperty";
 static constexpr char kMicrosoftAuthClientId[] = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
 static constexpr char kMicrosoftAuthScopes[] = "XboxLive.signin offline_access";
@@ -757,6 +759,33 @@ static std::wstring fwd(const std::wstring& s) {
         if (c == L'\\') c = L'/';
     }
     return r;
+}
+
+static std::wstring FileUriFromPath(const std::wstring& path) {
+    const std::wstring normalized = fwd(path);
+    if (normalized.empty()) return L"file:///";
+
+    std::wstring uri = L"file:///";
+    for (wchar_t c : normalized) {
+        switch (c) {
+        case L' ':
+            uri += L"%20";
+            break;
+        case L'#':
+            uri += L"%23";
+            break;
+        case L'%':
+            uri += L"%25";
+            break;
+        case L'?':
+            uri += L"%3F";
+            break;
+        default:
+            uri += c;
+            break;
+        }
+    }
+    return uri;
 }
 
 static std::string w2a(const std::wstring& w) {
@@ -2195,6 +2224,64 @@ static bool ExtractPrimaryModrinthFile(
     return !url.empty() && !filename.empty();
 }
 
+static std::wstring ToLowerW(std::wstring v) {
+    std::transform(v.begin(), v.end(), v.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+    return v;
+}
+
+struct BlockedMod {
+    const wchar_t* token;
+    const wchar_t* reason;
+};
+
+// Mods known to break this UWP runtime. Matching is intentionally by filename
+// substring because modpack file names vary by loader, version, and source.
+static const BlockedMod kBlockedMods[] = {
+    { L"essential", L"Essential injects a launch transformer that crashes in the embedded/UWP runtime" },
+    { L"crashassistant", L"Crash Assistant starts an external helper and hangs before GLFW startup" },
+    { L"crash-assistant", L"Crash Assistant starts an external helper and hangs before GLFW startup" },
+    { L"crash_assistant", L"Crash Assistant starts an external helper and hangs before GLFW startup" },
+    { L"rrls", L"Remove Reloading Screen failed config file canonical-path checks under LocalState" },
+    { L"remove-reloading-screen", L"Remove Reloading Screen failed config file canonical-path checks under LocalState" },
+    { L"iris", L"Iris rewrites shader/GPU texture setup and stalls on the Mesa/UWP render path" },
+    { L"ixeris", L"Ixeris replaces GLFW event polling/threading, which conflicts with the UWP GLFW shim" },
+    { L"puzzle", L"Puzzle applies splash/model mixins and currently hangs before the UWP GLFW shim loads" },
+};
+
+static const BlockedMod* FindBlockedModFile(const std::wstring& fileName) {
+    const std::wstring lower = ToLowerW(fileName);
+    for (const BlockedMod& b : kBlockedMods) {
+        if (lower.find(b.token) != std::wstring::npos) return &b;
+    }
+    return nullptr;
+}
+
+static bool IsBlockedModFile(const std::wstring& fileName) {
+    return FindBlockedModFile(fileName) != nullptr;
+}
+
+static int PurgeBlockedModsFromDir(const std::wstring& runtimeRoot, const std::wstring& modsDir) {
+    int removed = 0;
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((modsDir + L"\\*.jar").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const BlockedMod* blocked = FindBlockedModFile(fd.cFileName);
+        if (!blocked) continue;
+        const std::wstring path = modsDir + L"\\" + fd.cFileName;
+        WriteLogF(L"Removing blocked mod before launch: %s (%s)", fd.cFileName, blocked->reason);
+        if (DeleteFileW(path.c_str())) {
+            DeleteFileW(ModMetaPath(runtimeRoot, fd.cFileName).c_str());
+            ++removed;
+        } else {
+            WriteLogF(L"Failed to remove blocked mod: %s err=%u", path.c_str(), GetLastError());
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return removed;
+}
+
 static bool InstallModrinthProjectRecursive(
     const std::wstring& projectIdOrSlug,
     const std::wstring& runtimeRoot,
@@ -2277,6 +2364,11 @@ static bool InstallModrinthProjectRecursive(
             error = L"Modrinth version did not include a downloadable file";
             return false;
         }
+        if (const BlockedMod* blocked = FindBlockedModFile(filename)) {
+            error = L"Blocked incompatible mod: " + filename;
+            WriteLogF(L"%s (%s)", error.c_str(), blocked->reason);
+            return false;
+        }
 
         EnsureDirectoryTree(userModsDir);
         const std::wstring destination = userModsDir + L"\\" + SafeFileName(filename);
@@ -2333,25 +2425,6 @@ static bool InstallModrinthProject(
     std::set<std::wstring> visited;
     const std::wstring id = !card.projectId.empty() ? card.projectId : card.slug;
     return InstallModrinthProjectRecursive(id, runtimeRoot, userModsDir, visited, installed, &card, error);
-}
-
-// mods that are known to break this runtime; matched case-insensitively as a
-// substring of the jar filename. essential's transformer crashes on launch.
-static const wchar_t* kModpackBlockers[] = {
-    L"essential",
-};
-
-static std::wstring ToLowerW(std::wstring v) {
-    std::transform(v.begin(), v.end(), v.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
-    return v;
-}
-
-static bool IsBlockedModFile(const std::wstring& fileName) {
-    const std::wstring lower = ToLowerW(fileName);
-    for (const wchar_t* b : kModpackBlockers) {
-        if (lower.find(ToLowerW(b)) != std::wstring::npos) return true;
-    }
-    return false;
 }
 
 static bool WriteAllBytes(const std::wstring& path, const void* data, size_t size) {
@@ -2504,7 +2577,11 @@ static bool InstallModpack(const ModCard& card, const std::wstring& runtimeRoot,
             }
             const size_t slash = path.find_last_of(L"/\\");
             const std::wstring base = slash == std::wstring::npos ? path : path.substr(slash + 1);
-            if (IsBlockedModFile(base)) { ++skipped; continue; }
+            if (const BlockedMod* blocked = FindBlockedModFile(base)) {
+                WriteLogF(L"Skipping blocked modpack file: %s (%s)", base.c_str(), blocked->reason);
+                ++skipped;
+                continue;
+            }
             jobs.push_back({ path, durl, sha1, fsize });
         }
     } catch (const winrt::hresult_error&) {
@@ -2558,7 +2635,13 @@ static bool InstallModpack(const ModCard& card, const std::wstring& runtimeRoot,
         const std::wstring dest = ModpackDestForRelative(rel, gameDir, userModsDir);
         const size_t slash = dest.find_last_of(L'\\');
         const std::wstring base = slash == std::wstring::npos ? dest : dest.substr(slash + 1);
-        if (ToLowerW(dest).find(ToLowerW(userModsDir)) == 0 && IsBlockedModFile(base)) { ++skipped; continue; }
+        if (ToLowerW(dest).find(ToLowerW(userModsDir)) == 0) {
+            if (const BlockedMod* blocked = FindBlockedModFile(base)) {
+                WriteLogF(L"Skipping blocked modpack override: %s (%s)", base.c_str(), blocked->reason);
+                ++skipped;
+                continue;
+            }
+        }
         size_t outSize = 0;
         void* p = mz_zip_reader_extract_to_heap(&zip, i, &outSize, 0);
         if (!p) continue;
@@ -2575,7 +2658,8 @@ static bool InstallModpack(const ModCard& card, const std::wstring& runtimeRoot,
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                if (IsBlockedModFile(fd.cFileName)) {
+                if (const BlockedMod* blocked = FindBlockedModFile(fd.cFileName)) {
+                    WriteLogF(L"Deleting blocked modpack residue: %s (%s)", fd.cFileName, blocked->reason);
                     DeleteFileW((userModsDir + L"\\" + fd.cFileName).c_str());
                     DeleteFileW(ModMetaPath(runtimeRoot, fd.cFileName).c_str());
                     ++skipped;
@@ -5551,32 +5635,94 @@ static bool ResolveLaunchAuthConfig(ICoreWindow* window, LaunchAuthConfig& out) 
     return false;
 }
 
-static bool RedirectStdStreams(const std::wstring& path) {
-    int fd = -1;
-    if (_wsopen_s(&fd, path.c_str(), _O_CREAT | _O_TRUNC | _O_WRONLY | _O_TEXT,
-        _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0 || fd < 0) {
+static HANDLE OpenRedirectOutputFile(const std::wstring& path) {
+    EnsureDirectoryTree(GetParentDir(path));
+    return CreateFile2(
+        path.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        CREATE_ALWAYS,
+        nullptr);
+}
+
+static bool BindCrtFdToHandle(int targetFd, HANDLE fileHandle) {
+    if (fileHandle == INVALID_HANDLE_VALUE) return false;
+
+    HANDLE crtHandle = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(
+            GetCurrentProcess(),
+            fileHandle,
+            GetCurrentProcess(),
+            &crtHandle,
+            0,
+            TRUE,
+            DUPLICATE_SAME_ACCESS)) {
         return false;
     }
 
-    if (_dup2(fd, 1) != 0) {
-        _close(fd);
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(crtHandle), _O_TEXT);
+    if (fd < 0) {
+        CloseHandle(crtHandle);
         return false;
     }
-    if (_dup2(fd, 2) != 0) {
+
+    if (_dup2(fd, targetFd) != 0) {
         _close(fd);
         return false;
     }
     _close(fd);
+    return true;
+}
 
-    FILE* out = _fdopen(1, "w");
-    FILE* err = _fdopen(2, "w");
-    if (!out || !err) {
+static bool RedirectStdStreams(const std::wstring& stdoutPath, const std::wstring& stderrPath) {
+    if (g_redirectedStdoutHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_redirectedStdoutHandle);
+        g_redirectedStdoutHandle = INVALID_HANDLE_VALUE;
+    }
+    if (g_redirectedStderrHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_redirectedStderrHandle);
+        g_redirectedStderrHandle = INVALID_HANDLE_VALUE;
+    }
+
+    g_redirectedStdoutHandle = OpenRedirectOutputFile(stdoutPath);
+    if (g_redirectedStdoutHandle == INVALID_HANDLE_VALUE) {
         return false;
     }
-    *stdout = *out;
-    *stderr = *err;
+
+    g_redirectedStderrHandle = OpenRedirectOutputFile(stderrPath.empty() ? stdoutPath : stderrPath);
+    if (g_redirectedStderrHandle == INVALID_HANDLE_VALUE) {
+        CloseHandle(g_redirectedStdoutHandle);
+        g_redirectedStdoutHandle = INVALID_HANDLE_VALUE;
+        return false;
+    }
+
+    if (!SetStdHandle(STD_OUTPUT_HANDLE, g_redirectedStdoutHandle) ||
+        !SetStdHandle(STD_ERROR_HANDLE, g_redirectedStderrHandle)) {
+        return false;
+    }
+
+    if (!BindCrtFdToHandle(1, g_redirectedStdoutHandle) ||
+        !BindCrtFdToHandle(2, g_redirectedStderrHandle)) {
+        return false;
+    }
+
+    FILE* out = _fdopen(_dup(1), "w");
+    FILE* err = _fdopen(_dup(2), "w");
+    if (out) *stdout = *out;
+    if (err) *stderr = *err;
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+
+    printf("[launcher] stdout redirect probe\n");
+    fprintf(stderr, "[launcher] stderr redirect probe\n");
+    fflush(stdout);
+    fflush(stderr);
+
+    DWORD written = 0;
+    static const char kStdoutProbe[] = "[launcher] Win32 stdout redirect probe\r\n";
+    static const char kStderrProbe[] = "[launcher] Win32 stderr redirect probe\r\n";
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), kStdoutProbe, sizeof(kStdoutProbe) - 1, &written, nullptr);
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), kStderrProbe, sizeof(kStderrProbe) - 1, &written, nullptr);
     return true;
 }
 
@@ -5909,23 +6055,27 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring fabricLogPath = gameDir + L"\\logs\\fabric-loader.log";
     const std::wstring latestLogPath = gameDir + L"\\logs\\latest.log";
     const std::wstring xboxCompatLogPath = gameDir + L"\\xbox_compat.log";
+    const std::wstring stderrLogPath = exeDir + L"\\stderr_stream.log";
 
     EnsureDirectoryTree(gameDir + L"\\logs");
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
     EnsureDirectoryTree(userModsDir);
     EnsureDirectoryTree(lwjglTmpDir);
+    DeleteFileW(javaLog.c_str());
+    DeleteFileW(stderrLogPath.c_str());
     DeleteFileW(fabricLogPath.c_str());
     DeleteFileW(latestLogPath.c_str());
     DeleteFileW(xboxCompatLogPath.c_str());
 
-    if (!RedirectStdStreams(javaLog)) {
+    if (!RedirectStdStreams(javaLog, stderrLogPath)) {
         WriteLogF(L"Failed to redirect stdout/stderr errno=%d winerr=%u", errno, GetLastError());
     } else {
-        WriteLog(L"stdout/stderr redirected to java_output.log");
+        WriteLog(L"stdout redirected to java_output.log; stderr redirected to stderr_stream.log");
     }
 
     const std::vector<LogTailerConfig> tailerConfigs = {
         LogTailerConfig{ javaLog, L"java_output.log" },
+        LogTailerConfig{ stderrLogPath, L"stderr_stream.log" },
         LogTailerConfig{ fabricLogPath, L"fabric-loader.log" },
         LogTailerConfig{ latestLogPath, L"latest.log" },
         LogTailerConfig{ xboxCompatLogPath, L"xbox_compat.log" }
@@ -5994,6 +6144,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     } else {
         WriteLogF(L"LWJGL OpenGL library override missing: %s", selectedOpenGl.c_str());
     }
+    WriteLogF(L"Log4j configuration: %s", FileUriFromPath(logConfigPath).c_str());
     vmOptionStorage.push_back("-Dfabric.gameJarPath=" + w2a(fwd(clientJar)));
     vmOptionStorage.push_back("-Dfabric.modsFolder=" + w2a(fwd(userModsDir)));
     if (GetFileAttributesW(bundledModsDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
@@ -6001,7 +6152,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
     vmOptionStorage.push_back("-Djava.class.path=" + w2a(classPath));
     vmOptionStorage.push_back("-Duser.dir=" + w2a(fwd(gameDir)));
-    vmOptionStorage.push_back("-Dlog4j.configurationFile=" + w2a(fwd(logConfigPath)));
+    vmOptionStorage.push_back("-Dlog4j.configurationFile=" + w2a(FileUriFromPath(logConfigPath)));
     vmOptionStorage.push_back("-XX:ErrorFile=" + w2a(fwd(gameDir + L"\\hs_err_pid%p.log")));
 
     const std::vector<std::string> appArgs = {
@@ -6114,6 +6265,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     if (CheckAndLogJavaException(env, L"CallStaticVoidMethod(main)")) {
         LogTextFileTail(javaLog, L"java_output.log");
+        LogTextFileTail(stderrLogPath, L"stderr_stream.log");
         WriteLog(L"Embedded JVM failed after startup; terminating host process to avoid JVM/native reuse");
         ExitProcess(1);
         return false;
@@ -6396,6 +6548,10 @@ public:
         WriteLogF(L"downloadedLibrariesDir: %s", (gameDir + L"\\libraries").c_str());
         WriteLogF(L"bundledModsDir: %s", bundledModsDir.c_str());
         WriteLogF(L"userModsDir: %s", userModsDir.c_str());
+        const int blockedRemoved = PurgeBlockedModsFromDir(exeDir, userModsDir);
+        if (blockedRemoved > 0) {
+            WriteLogF(L"Removed %d blocked mod(s) from active profile before launch", blockedRemoved);
+        }
         WriteLogF(L"java.exe  exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);

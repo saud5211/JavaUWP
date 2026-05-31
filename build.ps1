@@ -302,7 +302,27 @@ New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime\bundled-mods"
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime\libraries") | Out-Null
 
 Copy-Item $mcExe (Join-Path $pkg "MC.Xbox.exe")
-Copy-Item (Join-Path $root "MC.Xbox\Package.appxmanifest") (Join-Path $pkg "AppxManifest.xml")
+# Auto-increment the package version so installs UPDATE in place (preserving LocalState)
+# instead of forcing an uninstall+reinstall. build = days since 2020 (climbs daily),
+# revision = per-day counter persisted in .local; cross-day builds always climb even if
+# the counter file is absent on a fresh clone.
+$verFile = Join-Path $root ".local\app_build.txt"
+$verBuild = [int][math]::Floor(((Get-Date) - [datetime]'2020-01-01').TotalDays)
+$verRev = 0
+if (Test-Path $verFile) {
+    $prevParts = ((Get-Content $verFile -Raw).Trim()) -split '\.'
+    if ($prevParts.Count -eq 4 -and [int]$prevParts[2] -eq $verBuild) { $verRev = [int]$prevParts[3] + 1 }
+}
+if ($verRev -gt 65535) { $verRev = 65535 }
+$appVersion = "1.0.$verBuild.$verRev"
+New-Item -ItemType Directory -Force -Path (Split-Path $verFile) | Out-Null
+Set-Content -Path $verFile -Value $appVersion -NoNewline
+
+$manifestOut = Join-Path $pkg "AppxManifest.xml"
+$manifestText = [System.IO.File]::ReadAllText((Join-Path $root "MC.Xbox\Package.appxmanifest"))
+$manifestText = [regex]::Replace($manifestText, '(<Identity\b[^>]*\bVersion=")\d+\.\d+\.\d+\.\d+(")', ('${1}' + $appVersion + '${2}'))
+[System.IO.File]::WriteAllText($manifestOut, $manifestText)
+Write-Host "App package version: $appVersion"
 
 Write-Host "Copying launcher-owned runtime files..."
 $loaderVersion = $ProjectConfig.FabricLoaderVersion
