@@ -207,7 +207,6 @@ if (-not (Test-Path $remappedJar)) {
         -ArgumentList $javaArgumentLine `
         -WorkingDirectory $gameDir `
         -NoNewWindow `
-        -Wait `
         -PassThru `
         -RedirectStandardOutput $remapStdoutLog `
         -RedirectStandardError $remapStderrLog
