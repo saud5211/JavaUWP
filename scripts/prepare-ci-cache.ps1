@@ -166,6 +166,15 @@ if ($assetIndexId -ne $assetIndex) {
 
 Write-Host "=== Generating Fabric remapped client jar ==="
 $remappedJar = Join-Path $gameDir ".fabric\remappedJars\minecraft-$version-$loaderVersion\client-intermediary.jar"
+$existingRemappedJar = Get-Item -LiteralPath $remappedJar -ErrorAction SilentlyContinue
+if ($existingRemappedJar -and $existingRemappedJar.Length -le 0) {
+    Write-Warning "Discarding empty cached remapped client jar at $remappedJar."
+    Remove-Item -LiteralPath $remappedJar -Force
+    $existingRemappedJar = $null
+}
+if ($existingRemappedJar) {
+    Write-Host "Using cached Fabric remapped client jar -> $remappedJar"
+}
 if (-not (Test-Path $remappedJar)) {
     $clientJar = Join-Path $gameDir "versions\$version\$version.jar"
     if (-not (Test-Path $clientJar)) {
