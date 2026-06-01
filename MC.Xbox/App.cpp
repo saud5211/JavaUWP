@@ -206,6 +206,11 @@ static bool EnsureDirectoryTree(const std::wstring& path) {
     return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+static bool DirectoryExists(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 static std::wstring GetParentDir(const std::wstring& path) {
     const size_t slash = path.find_last_of(L"\\/");
     return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
@@ -2296,6 +2301,10 @@ static const BlockedMod kBlockedMods[] = {
     { L"iris", L"Iris rewrites shader/GPU texture setup and stalls on the Mesa/UWP render path" },
     { L"ixeris", L"Ixeris replaces GLFW event polling/threading, which conflicts with the UWP GLFW shim" },
     { L"puzzle", L"Puzzle applies splash/model mixins and currently hangs before the UWP GLFW shim loads" },
+    { L"lambdacontrols", L"LambdaControls conflicts with the bundled Bandit controller compatibility layer" },
+    { L"lambda-controls", L"LambdaControls conflicts with the bundled Bandit controller compatibility layer" },
+    { L"midnightcontrols", L"MidnightControls conflicts with the bundled Bandit controller compatibility layer" },
+    { L"midnight-controls", L"MidnightControls conflicts with the bundled Bandit controller compatibility layer" },
 };
 
 static const BlockedMod* FindBlockedModFile(const std::wstring& fileName) {
@@ -2477,6 +2486,462 @@ static bool ModJarMatchesFabricLoader(const std::wstring& jarPath, const std::st
     }
 }
 
+static bool FabricModDependsOn(const std::wstring& jarPath, const wchar_t* modId) {
+    using namespace winrt::Windows::Data::Json;
+    if (!modId || !*modId) return false;
+
+    std::wstring fabricModJson;
+    if (!ReadZipTextFile(jarPath, "fabric.mod.json", fabricModJson)) {
+        return false;
+    }
+
+    try {
+        JsonObject root = JsonObject::Parse(winrt::hstring(fabricModJson.c_str()));
+        if (!root.HasKey(L"depends") || root.GetNamedValue(L"depends").ValueType() != JsonValueType::Object) {
+            return false;
+        }
+
+        JsonObject depends = root.GetNamedObject(L"depends");
+        return depends.HasKey(modId);
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool ModJarHasFabricId(const std::wstring& jarPath, const wchar_t* modId) {
+    using namespace winrt::Windows::Data::Json;
+    if (!modId || !*modId) return false;
+
+    std::wstring fabricModJson;
+    if (!ReadZipTextFile(jarPath, "fabric.mod.json", fabricModJson)) {
+        return false;
+    }
+
+    try {
+        JsonObject root = JsonObject::Parse(winrt::hstring(fabricModJson.c_str()));
+        if (!root.HasKey(L"id") || root.GetNamedValue(L"id").ValueType() != JsonValueType::String) {
+            return false;
+        }
+        return root.GetNamedString(L"id") == modId;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool FindModJarByFabricIdOrName(
+    const std::wstring& modsDir,
+    const wchar_t* modId,
+    const wchar_t* fileNameToken,
+    std::wstring& jarPath) {
+    jarPath.clear();
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((modsDir + L"\\*.jar").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    std::wstring fallback;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring path = modsDir + L"\\" + fd.cFileName;
+        if (ModJarHasFabricId(path, modId)) {
+            jarPath = path;
+            FindClose(h);
+            return true;
+        }
+
+        if (fallback.empty() && fileNameToken && *fileNameToken) {
+            const std::wstring lowerName = ToLowerW(fd.cFileName);
+            if (lowerName.find(fileNameToken) != std::wstring::npos) {
+                fallback = path;
+            }
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    if (!fallback.empty()) {
+        jarPath = fallback;
+        return true;
+    }
+    return false;
+}
+
+static bool TomlLineHasKey(const std::wstring& line, const std::wstring& key) {
+    size_t pos = 0;
+    while (pos < line.size() && iswspace(line[pos])) ++pos;
+    if (pos + key.size() > line.size() || line.compare(pos, key.size(), key) != 0) return false;
+    pos += key.size();
+    while (pos < line.size() && iswspace(line[pos])) ++pos;
+    return pos < line.size() && line[pos] == L'=';
+}
+
+static bool TomlLineStartsSection(const std::wstring& line, std::wstring* sectionName = nullptr) {
+    size_t start = 0;
+    while (start < line.size() && iswspace(line[start])) ++start;
+    if (start >= line.size() || line[start] != L'[') return false;
+
+    size_t end = line.find(L']', start + 1);
+    if (end == std::wstring::npos) return false;
+    if (sectionName) {
+        *sectionName = line.substr(start + 1, end - start - 1);
+    }
+    return true;
+}
+
+static std::wstring TrimWhitespace(std::wstring value) {
+    while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+    while (!value.empty() && iswspace(value.back())) value.pop_back();
+    return value;
+}
+
+static std::wstring TomlValueForLine(const std::wstring& line) {
+    const size_t eq = line.find(L'=');
+    if (eq == std::wstring::npos) return std::wstring();
+
+    std::wstring value = line.substr(eq + 1);
+    const size_t comment = value.find(L'#');
+    if (comment != std::wstring::npos) value = value.substr(0, comment);
+    return ToLowerW(TrimWhitespace(value));
+}
+
+static bool TomlValueMatchesAny(const std::wstring& line, const std::vector<std::wstring>& values) {
+    if (values.empty()) return true;
+    const std::wstring actual = TomlValueForLine(line);
+    for (std::wstring expected : values) {
+        expected = ToLowerW(TrimWhitespace(expected));
+        if (actual == expected) return true;
+    }
+    return false;
+}
+
+static bool UpsertTomlTopLevelSetting(
+    std::wstring& text,
+    const std::wstring& key,
+    const std::wstring& value,
+    bool onlyWhenDefault) {
+    std::wstringstream in(text);
+    std::wstring out;
+    std::wstring line;
+    bool found = false;
+    bool changed = false;
+    bool inTopLevel = true;
+
+    while (std::getline(in, line)) {
+        bool hadCr = !line.empty() && line.back() == L'\r';
+        std::wstring normalized = hadCr ? line.substr(0, line.size() - 1) : line;
+
+        if (TomlLineStartsSection(normalized)) {
+            inTopLevel = false;
+        }
+
+        if (inTopLevel && TomlLineHasKey(normalized, key)) {
+            found = true;
+            const std::wstring lower = ToLowerW(normalized);
+            if (!onlyWhenDefault || lower.find(L"\"default\"") != std::wstring::npos) {
+                normalized = key + L" = " + value;
+                changed = true;
+            }
+        }
+
+        out += normalized;
+        if (hadCr) out += L"\r";
+        out += L"\n";
+    }
+
+    if (!found) {
+        text = key + L" = " + value + L"\n" + out;
+        return true;
+    }
+
+    if (changed) text = out;
+    return changed;
+}
+
+static bool UpsertTomlTopLevelSettingWhenMissingOrValues(
+    std::wstring& text,
+    const std::wstring& key,
+    const std::wstring& value,
+    const std::vector<std::wstring>& oldValues) {
+    std::wstringstream in(text);
+    std::wstring out;
+    std::wstring line;
+    bool found = false;
+    bool changed = false;
+    bool inTopLevel = true;
+
+    while (std::getline(in, line)) {
+        bool hadCr = !line.empty() && line.back() == L'\r';
+        std::wstring normalized = hadCr ? line.substr(0, line.size() - 1) : line;
+
+        if (TomlLineStartsSection(normalized)) {
+            inTopLevel = false;
+        }
+
+        if (inTopLevel && TomlLineHasKey(normalized, key)) {
+            found = true;
+            if (TomlValueMatchesAny(normalized, oldValues)) {
+                normalized = key + L" = " + value;
+                changed = true;
+            }
+        }
+
+        out += normalized;
+        if (hadCr) out += L"\r";
+        out += L"\n";
+    }
+
+    if (!found) {
+        text = key + L" = " + value + L"\n" + out;
+        return true;
+    }
+
+    if (changed) text = out;
+    return changed;
+}
+
+static bool UpsertTomlSectionSetting(
+    std::wstring& text,
+    const std::wstring& section,
+    const std::wstring& key,
+    const std::wstring& value,
+    bool onlyWhenDefault) {
+    std::wstringstream in(text);
+    std::wstring out;
+    std::wstring line;
+    bool inSection = false;
+    bool sawSection = false;
+    bool found = false;
+    bool changed = false;
+
+    while (std::getline(in, line)) {
+        bool hadCr = !line.empty() && line.back() == L'\r';
+        std::wstring normalized = hadCr ? line.substr(0, line.size() - 1) : line;
+
+        std::wstring nextSection;
+        if (TomlLineStartsSection(normalized, &nextSection)) {
+            if (inSection && !found) {
+                out += key + L" = " + value + L"\n";
+                found = true;
+                changed = true;
+            }
+            inSection = nextSection == section;
+            sawSection = sawSection || inSection;
+        } else if (inSection && TomlLineHasKey(normalized, key)) {
+            found = true;
+            const std::wstring lower = ToLowerW(normalized);
+            if (!onlyWhenDefault || lower.find(L"\"default\"") != std::wstring::npos) {
+                normalized = key + L" = " + value;
+                changed = true;
+            }
+        }
+
+        out += normalized;
+        if (hadCr) out += L"\r";
+        out += L"\n";
+    }
+
+    if (sawSection && inSection && !found) {
+        out += key + L" = " + value + L"\n";
+        found = true;
+        changed = true;
+    } else if (!sawSection) {
+        out += L"\n[" + section + L"]\n" + key + L" = " + value + L"\n";
+        found = true;
+        changed = true;
+    }
+
+    if (changed) text = out;
+    return changed;
+}
+
+static bool UpsertTomlSectionSettingWhenMissingOrValues(
+    std::wstring& text,
+    const std::wstring& section,
+    const std::wstring& key,
+    const std::wstring& value,
+    const std::vector<std::wstring>& oldValues) {
+    std::wstringstream in(text);
+    std::wstring out;
+    std::wstring line;
+    bool inSection = false;
+    bool sawSection = false;
+    bool found = false;
+    bool changed = false;
+
+    while (std::getline(in, line)) {
+        bool hadCr = !line.empty() && line.back() == L'\r';
+        std::wstring normalized = hadCr ? line.substr(0, line.size() - 1) : line;
+
+        std::wstring nextSection;
+        if (TomlLineStartsSection(normalized, &nextSection)) {
+            if (inSection && !found) {
+                out += key + L" = " + value + L"\n";
+                found = true;
+                changed = true;
+            }
+            inSection = nextSection == section;
+            sawSection = sawSection || inSection;
+        } else if (inSection && TomlLineHasKey(normalized, key)) {
+            found = true;
+            if (TomlValueMatchesAny(normalized, oldValues)) {
+                normalized = key + L" = " + value;
+                changed = true;
+            }
+        }
+
+        out += normalized;
+        if (hadCr) out += L"\r";
+        out += L"\n";
+    }
+
+    if (sawSection && inSection && !found) {
+        out += key + L" = " + value + L"\n";
+        found = true;
+        changed = true;
+    } else if (!sawSection) {
+        out += L"\n[" + section + L"]\n" + key + L" = " + value + L"\n";
+        found = true;
+        changed = true;
+    }
+
+    if (changed) text = out;
+    return changed;
+}
+
+static bool JsonNumberMissingOrDefault(const winrt::Windows::Data::Json::JsonObject& obj, const wchar_t* key, double defaultValue) {
+    using namespace winrt::Windows::Data::Json;
+    if (!obj.HasKey(key)) return true;
+    try {
+        const IJsonValue value = obj.GetNamedValue(key);
+        return value.ValueType() == JsonValueType::Number &&
+            std::fabs(value.GetNumber() - defaultValue) < 0.0001;
+    } catch (...) {
+        return true;
+    }
+}
+
+static bool JsonStringMissingOrDefault(const winrt::Windows::Data::Json::JsonObject& obj, const wchar_t* key, const wchar_t* defaultValue) {
+    using namespace winrt::Windows::Data::Json;
+    if (!obj.HasKey(key)) return true;
+    try {
+        const IJsonValue value = obj.GetNamedValue(key);
+        if (value.ValueType() != JsonValueType::String) return true;
+        return obj.GetNamedString(key) == defaultValue;
+    } catch (...) {
+        return true;
+    }
+}
+
+static bool SetJsonNumberIfDefault(winrt::Windows::Data::Json::JsonObject& obj, const wchar_t* key, double value, double defaultValue) {
+    using namespace winrt::Windows::Data::Json;
+    if (!JsonNumberMissingOrDefault(obj, key, defaultValue)) return false;
+    obj.Insert(key, JsonValue::CreateNumberValue(value));
+    return true;
+}
+
+static bool SetJsonStringIfDefault(winrt::Windows::Data::Json::JsonObject& obj, const wchar_t* key, const wchar_t* value, const wchar_t* defaultValue) {
+    using namespace winrt::Windows::Data::Json;
+    if (!JsonStringMissingOrDefault(obj, key, defaultValue)) return false;
+    obj.Insert(key, JsonValue::CreateStringValue(value));
+    return true;
+}
+
+static bool ConfigureLambdaControlsDefaults(const std::wstring& gameDir, const std::wstring& userModsDir) {
+    std::wstring lambdaControlsJar;
+    if (!FindModJarByFabricIdOrName(userModsDir, L"lambdacontrols", L"lambdacontrols", lambdaControlsJar)) {
+        return false;
+    }
+
+    const std::wstring configPath = gameDir + L"\\config\\lambdacontrols.toml";
+    std::wstring configText;
+    if (!ReadTextFile(configPath, configText) &&
+        !ReadZipTextFile(lambdaControlsJar, "config.toml", configText)) {
+        configText =
+            L"controls = \"controller\"\n"
+            L"auto_switch_mode = true\n"
+            L"\n"
+            L"[controller]\n"
+            L"id = 0\n"
+            L"type = \"xbox\"\n";
+    }
+
+    bool changed = false;
+    changed |= UpsertTomlTopLevelSetting(configText, L"controls", L"\"controller\"", true);
+    changed |= UpsertTomlTopLevelSetting(configText, L"auto_switch_mode", L"true", false);
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"gameplay", L"analog_movement", L"false", { L"true" });
+    changed |= UpsertTomlSectionSetting(configText, L"controller", L"id", L"0", false);
+    changed |= UpsertTomlSectionSetting(configText, L"controller", L"type", L"\"xbox\"", true);
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"controller", L"dead_zone", L"0.22", { L"0.20", L"0.2", L"0.30", L"0.3" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"controller", L"right_dead_zone", L"0.22", { L"0.25", L"0.30", L"0.3" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"controller", L"left_dead_zone", L"0.22", { L"0.25", L"0.30", L"0.3" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"controller", L"rotation_speed", L"24.0", { L"8.0", L"8", L"10.0", L"10", L"40.0", L"40" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"controller", L"mouse_speed", L"24.0", { L"18.0", L"18", L"25.0", L"25", L"30.0", L"30" });
+
+    if (changed) {
+        if (WriteTextFile(configPath, configText)) {
+            WriteLogF(L"LambdaControls config seeded for UWP controller defaults: %s", configPath.c_str());
+        } else {
+            WriteLogF(L"Failed to write LambdaControls config: %s err=%u", configPath.c_str(), GetLastError());
+        }
+    } else {
+        WriteLog(L"LambdaControls config already has non-default controller settings; leaving it unchanged");
+    }
+    return true;
+}
+
+static bool ConfigureMidnightControlsDefaults(const std::wstring& gameDir, const std::wstring& userModsDir) {
+    std::wstring midnightControlsJar;
+    if (!FindModJarByFabricIdOrName(userModsDir, L"midnightcontrols", L"midnightcontrols", midnightControlsJar)) {
+        return false;
+    }
+
+    using namespace winrt::Windows::Data::Json;
+    const std::wstring configPath = gameDir + L"\\config\\midnightcontrols.json";
+    JsonObject obj = JsonObject();
+
+    std::wstring configText;
+    if (ReadTextFile(configPath, configText)) {
+        try {
+            obj = JsonObject::Parse(winrt::hstring(configText.c_str()));
+        } catch (...) {
+            obj = JsonObject();
+        }
+    }
+
+    bool changed = false;
+    changed |= SetJsonStringIfDefault(obj, L"controlsMode", L"CONTROLLER", L"DEFAULT");
+    changed |= SetJsonStringIfDefault(obj, L"controllerType", L"XBOX", L"DEFAULT");
+    changed |= SetJsonNumberIfDefault(obj, L"rightDeadZone", 0.22, 0.30);
+    changed |= SetJsonNumberIfDefault(obj, L"rightDeadZone", 0.22, 0.25);
+    changed |= SetJsonNumberIfDefault(obj, L"leftDeadZone", 0.22, 0.30);
+    changed |= SetJsonNumberIfDefault(obj, L"leftDeadZone", 0.22, 0.25);
+    changed |= SetJsonNumberIfDefault(obj, L"rotationSpeed", 20.0, 12.0);
+    changed |= SetJsonNumberIfDefault(obj, L"rotationSpeed", 20.0, 35.0);
+    changed |= SetJsonNumberIfDefault(obj, L"yAxisRotationSpeed", 20.0, 12.0);
+    changed |= SetJsonNumberIfDefault(obj, L"yAxisRotationSpeed", 20.0, 35.0);
+    changed |= SetJsonNumberIfDefault(obj, L"mouseSpeed", 24.0, 18.0);
+    changed |= SetJsonNumberIfDefault(obj, L"mouseSpeed", 24.0, 25.0);
+
+    if (changed) {
+        const std::wstring out = obj.Stringify().c_str();
+        if (WriteTextFile(configPath, out)) {
+            WriteLogF(L"MidnightControls config seeded for UWP controller defaults: %s", configPath.c_str());
+        } else {
+            WriteLogF(L"Failed to write MidnightControls config: %s err=%u", configPath.c_str(), GetLastError());
+        }
+    } else {
+        WriteLog(L"MidnightControls config already has non-default controller settings; leaving it unchanged");
+    }
+    return true;
+}
+
+static void ConfigureKnownModDefaults(const std::wstring& gameDir, const std::wstring& userModsDir) {
+    const bool hasLambdaControls = ConfigureLambdaControlsDefaults(gameDir, userModsDir);
+    const bool hasMidnightControls = ConfigureMidnightControlsDefaults(gameDir, userModsDir);
+    const bool legacyControllerMod = hasLambdaControls || hasMidnightControls;
+    SetEnvironmentVariableW(L"MC_LEGACY_CONTROLLER_MOD", legacyControllerMod ? L"1" : L"0");
+    WriteLogF(L"Legacy controller mod input mode: %s", legacyControllerMod ? L"enabled" : L"disabled");
+}
+
 static int PurgeBlockedModsFromDir(const std::wstring& runtimeRoot, const std::wstring& modsDir) {
     int removed = 0;
     WIN32_FIND_DATAW fd = {};
@@ -2617,6 +3082,16 @@ static bool InstallModrinthProjectRecursive(
                 WriteLogF(L"Skipping Modrinth file for target loader %s: %s",
                     a2w(loaderVersion.c_str()).c_str(), lastSkipReason.c_str());
                 continue;
+            }
+
+            if (loaderId == "fabric" &&
+                ToLowerW(projectIdOrSlug) != L"p7dr8msh" &&
+                FabricModDependsOn(tempPath, L"fabric")) {
+                WriteLogF(L"Mod %s requires Fabric API; ensuring Fabric API dependency", filename.c_str());
+                if (!InstallModrinthProjectRecursive(L"P7dR8mSH", runtimeRoot, userModsDir, visited, installed, nullptr, error, gameVersion, loaderId, loaderVersion)) {
+                    DeleteFileW(tempPath.c_str());
+                    return false;
+                }
             }
 
             if (version.HasKey(L"dependencies") &&
@@ -7047,6 +7522,11 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     EnsureDirectoryTree(gameDir + L"\\showdown");
     EnsureDirectoryTree(exeDir + L"\\showdown");
     EnsureDirectoryTree(userModsDir);
+    const int earlyBlockedRemoved = PurgeBlockedModsFromDir(exeDir, userModsDir);
+    if (earlyBlockedRemoved > 0) {
+        WriteLogF(L"Removed %d blocked mod(s) from active profile before configuring launch", earlyBlockedRemoved);
+    }
+    ConfigureKnownModDefaults(gameDir, userModsDir);
     if (SetCurrentDirectoryW(gameDir.c_str())) {
         WriteLogF(L"Process current directory set to gameDir: %s", gameDir.c_str());
     } else {
@@ -7155,8 +7635,22 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     WriteLogF(L"Log4j configuration: %s", FileUriFromPath(logConfigPath).c_str());
     vmOptionStorage.push_back("-Dfabric.gameJarPath=" + w2a(fwd(clientJar)));
     vmOptionStorage.push_back("-Dfabric.modsFolder=" + w2a(fwd(userModsDir)));
-    if (GetFileAttributesW(bundledModsDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        vmOptionStorage.push_back("-Dfabric.addMods=" + w2a(fwd(bundledModsDir)));
+    std::vector<std::wstring> fabricAddMods;
+    if (DirectoryExists(bundledModsDir)) {
+        fabricAddMods.push_back(bundledModsDir);
+    }
+    if (launchVersion.find(L"fabric-loader-0.14.") != std::wstring::npos &&
+        DirectoryExists(userModsDir)) {
+        fabricAddMods.push_back(userModsDir);
+    }
+    if (!fabricAddMods.empty()) {
+        std::wstring addModsValue;
+        for (const std::wstring& path : fabricAddMods) {
+            if (!addModsValue.empty()) addModsValue += L";";
+            addModsValue += fwd(path);
+        }
+        vmOptionStorage.push_back("-Dfabric.addMods=" + w2a(addModsValue));
+        WriteLogF(L"Fabric addMods paths: %s", addModsValue.c_str());
     }
     vmOptionStorage.push_back("-Djava.class.path=" + w2a(classPath));
     vmOptionStorage.push_back("-Duser.dir=" + w2a(fwd(gameDir)));

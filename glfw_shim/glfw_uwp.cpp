@@ -364,6 +364,10 @@ static bool g_keyboardHooksInstalled = false;
 static bool g_gameInputCreateTried = false;
 static bool g_gamepad_present = false;
 static bool g_haveGameInputGamepadState = false;
+static bool g_haveGameInputPollCache = false;
+static ULONGLONG g_lastGameInputPollMs = 0;
+static bool g_legacyControllerModModeLogged = false;
+static bool g_lastLegacyControllerModMode = false;
 static unsigned char g_key_state[512] = {};
 static GameInputGamepadState g_lastGameInputGamepadState = {};
 static GLFWgamepadstate g_gamepad_state = {};
@@ -721,6 +725,30 @@ static float ClampGamepadAxis(float value) {
     return value;
 }
 
+static float AbsGamepadAxis(float value) {
+    return value < 0.0f ? -value : value;
+}
+
+static bool LegacyControllerModMode() {
+    const bool enabled = EnvFlagEnabled(L"MC_LEGACY_CONTROLLER_MOD");
+    if (!g_legacyControllerModModeLogged || enabled != g_lastLegacyControllerModMode) {
+        g_legacyControllerModModeLogged = true;
+        g_lastLegacyControllerModMode = enabled;
+        ShimLog("Legacy controller mod input mode: %s", enabled ? "enabled" : "disabled");
+    }
+    return enabled;
+}
+
+static float ShapeStickAxisForLegacyControllerMods(float value) {
+    value = ClampGamepadAxis(value);
+    if (!LegacyControllerModMode()) return value;
+
+    if (AbsGamepadAxis(value) < 0.08f) {
+        return 0.0f;
+    }
+    return ClampGamepadAxis(value * 1.12f);
+}
+
 static unsigned char GamepadButton(GameInputGamepadButtons buttons, GameInputGamepadButtons mask) {
     return (buttons & mask) ? GLFW_PRESS : GLFW_RELEASE;
 }
@@ -746,10 +774,10 @@ static void ConvertGameInputGamepadState(const GameInputGamepadState& state) {
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_DOWN] = GamepadButton(state.buttons, GameInputGamepadDPadDown);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_LEFT] = GamepadButton(state.buttons, GameInputGamepadDPadLeft);
 
-    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_X] = ClampGamepadAxis(state.leftThumbstickX);
-    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] = ClampGamepadAxis(-state.leftThumbstickY);
-    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_X] = ClampGamepadAxis(state.rightThumbstickX);
-    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y] = ClampGamepadAxis(-state.rightThumbstickY);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_X] = ShapeStickAxisForLegacyControllerMods(state.leftThumbstickX);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] = ShapeStickAxisForLegacyControllerMods(-state.leftThumbstickY);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_X] = ShapeStickAxisForLegacyControllerMods(state.rightThumbstickX);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y] = ShapeStickAxisForLegacyControllerMods(-state.rightThumbstickY);
     g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] = ClampGamepadAxis(state.leftTrigger * 2.0f - 1.0f);
     g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] = ClampGamepadAxis(state.rightTrigger * 2.0f - 1.0f);
 
@@ -759,6 +787,13 @@ static void ConvertGameInputGamepadState(const GameInputGamepadState& state) {
 
 static bool PollGameInputGamepad(bool fireCallbacks) {
     if (!EnsureGameInput()) return false;
+
+    const ULONGLONG nowMs = GetTickCount64();
+    if (g_haveGameInputPollCache && nowMs - g_lastGameInputPollMs <= 4) {
+        return g_gamepad_present;
+    }
+    g_haveGameInputPollCache = true;
+    g_lastGameInputPollMs = nowMs;
 
     ComPtr<IGameInputReading> reading;
     HRESULT hr = g_gameInput->GetCurrentReading(GameInputKindGamepad, nullptr, reading.GetAddressOf());
@@ -811,6 +846,7 @@ static bool PollGameInputGamepad(bool fireCallbacks) {
     }
 
     if (!previousPresent && fireCallbacks && g_joystick_cb) {
+        ShimLog("GameInput gamepad callback GLFW_CONNECTED");
         g_joystick_cb(GLFW_JOYSTICK_1, GLFW_CONNECTED);
     }
     return true;
@@ -1379,6 +1415,8 @@ extern "C" __declspec(dllexport) void glfwTerminate(void) {
     g_charReceivedHandler.Reset();
     g_keyboardHooksInstalled = false;
     ZeroMemory(g_key_state, sizeof(g_key_state));
+    g_haveGameInputPollCache = false;
+    g_lastGameInputPollMs = 0;
     if (p_eglMakeCurrent && g_eglDisplay != EGL_NO_DISPLAY) {
         p_eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
@@ -1820,7 +1858,12 @@ extern "C" __declspec(dllexport) GLFWjoystickfun glfwSetJoystickCallback(GLFWjoy
         ShimLog("glfwSetJoystickCallback cb=%p", cb);
     }
     if (cb) {
-        PollGameInputGamepad(false);
+        const bool wasPresent = g_gamepad_present;
+        const bool present = PollGameInputGamepad(true);
+        if (present && wasPresent) {
+            ShimLog("glfwSetJoystickCallback immediate GLFW_CONNECTED");
+            cb(GLFW_JOYSTICK_1, GLFW_CONNECTED);
+        }
     }
     return p;
 }

@@ -40,8 +40,15 @@ Remove-Item -Recurse -Force $buildRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $classesDir | Out-Null
 New-Item -ItemType Directory -Force -Path $modsDir | Out-Null
 
-$sources = Get-ChildItem $srcJava -Recurse -Filter "*.java" | Select-Object -ExpandProperty FullName
 $disabledMixins = @()
+$disabledSources = @()
+$controllerCompatVersions = @("1.16.5", "1.19.2")
+if ($controllerCompatVersions -notcontains $MinecraftVersion) {
+    $disabledMixins += @("BanditControllerClientMixin", "BanditControllerScreenMixin")
+    $disabledSources += "BanditControllerCompat"
+}
+
+$sources = Get-ChildItem $srcJava -Recurse -Filter "*.java" | Select-Object -ExpandProperty FullName
 if ($MinecraftVersion -eq $ProjectConfig.MinecraftVersion) {
     $disabledMixins += "ZipFsBypass121Mixin"
 } else {
@@ -64,11 +71,25 @@ if (-not $hasSystemDetailsClass) {
 
 $sources = @($sources | Where-Object {
     $name = [System.IO.Path]::GetFileNameWithoutExtension($_)
-    $disabledMixins -notcontains $name
+    ($disabledMixins -notcontains $name) -and ($disabledSources -notcontains $name)
 })
 if (-not $sources) { throw "No compatibility mod sources found" }
 
 $compileJars = @($clientJar, $mixinJar)
+$lwjglJar = Get-ChildItem -LiteralPath (Join-Path $gameDir "libraries\org\lwjgl\lwjgl") -Recurse -Filter "lwjgl-*.jar" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike "*natives*" } |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1
+$lwjglGlfwJar = Get-ChildItem -LiteralPath (Join-Path $gameDir "libraries\org\lwjgl\lwjgl-glfw") -Recurse -Filter "lwjgl-glfw-*.jar" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike "*natives*" } |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1
+if ($lwjglJar) {
+    $compileJars += $lwjglJar.FullName
+}
+if ($lwjglGlfwJar) {
+    $compileJars += $lwjglGlfwJar.FullName
+}
 $oshiJar = Get-ChildItem -LiteralPath (Join-Path $gameDir "libraries\com\github\oshi\oshi-core") -Recurse -Filter "oshi-core-*.jar" -ErrorAction SilentlyContinue |
     Sort-Object FullName -Descending |
     Select-Object -First 1
