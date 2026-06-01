@@ -352,6 +352,13 @@ $manifestText = [regex]::Replace($manifestText, '(<Identity\b[^>]*\bVersion=")\d
 Write-Host "App package version: $appVersion"
 
 Write-Host "Copying launcher-owned runtime files..."
+$versionCatalogSource = Join-Path $root $ProjectConfig.VersionCatalog
+if (-not (Test-Path $versionCatalogSource)) {
+    throw "Version catalog not found at $versionCatalogSource"
+}
+Copy-Item $versionCatalogSource (Join-Path $pkg "runtime\version_catalog.tsv") -Force
+Write-Host "Version catalog: $versionCatalogSource"
+
 $loaderVersion = $ProjectConfig.FabricLoaderVersion
 $loaderRelative = "net\fabricmc\fabric-loader\$loaderVersion\fabric-loader-$loaderVersion.jar"
 $loaderSrc = Join-Path $gameDir "libraries\$loaderRelative"

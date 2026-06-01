@@ -263,6 +263,7 @@ static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
         L"exe=" + FileStamp(packageDir + L"\\MC.Xbox.exe") + L"\n" +
         L"manifest=" + FileStamp(packageDir + L"\\AppxManifest.xml") + L"\n" +
         L"downloadManifest=" + FileStamp(packageDir + L"\\download_manifest.tsv") + L"\n" +
+        L"versionCatalog=" + FileStamp(packageDir + L"\\runtime\\version_catalog.tsv") + L"\n" +
         L"minecraft=" + std::wstring(kMinecraftVersionW) + L"\n" +
         L"jreRelease=" + FileStamp(packageDir + L"\\jre\\release") + L"\n" +
         L"jvm=" + FileStamp(packageDir + L"\\jre\\bin\\server\\jvm.dll") + L"\n" +
@@ -360,6 +361,7 @@ static bool SeedLocalRuntime(
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\runtime\\bundled-mods", localDir + L"\\game\\mods");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\runtime\\log_configs", localDir + L"\\game\\log_configs");
+    CopyFileIfNeeded(packageDir + L"\\runtime\\version_catalog.tsv", localDir + L"\\runtime\\version_catalog.tsv");
     if (progress) {
         progress(L"Copying Java runtime", L"Preparing JVM files", 0.52f);
     }
@@ -2840,22 +2842,277 @@ static unsigned StartDetailFetch(const ModCard& card) {
 
 static const wchar_t* kVanillaProfileId = L"vanilla";
 
+struct LaunchTarget {
+    std::wstring targetId;
+    std::wstring displayName;
+    std::wstring minecraftVersion;
+    std::wstring loader;
+    std::wstring loaderVersion;
+    std::wstring javaRuntime;
+    std::wstring supportLevel;
+    std::wstring notes;
+};
+
 struct Profile {
     std::wstring id;
     std::wstring name;
+    std::wstring minecraftVersion;
+    std::wstring loader;
+    std::wstring loaderVersion;
+    std::wstring targetId;
     bool builtin = false;
 };
 
 static std::wstring ProfilesRoot(const std::wstring& runtimeRoot) { return runtimeRoot + L"\\profiles"; }
 static std::wstring ProfileDir(const std::wstring& runtimeRoot, const std::wstring& id) { return ProfilesRoot(runtimeRoot) + L"\\" + id; }
 static std::wstring ProfileModsDir(const std::wstring& runtimeRoot, const std::wstring& id) { return ProfileDir(runtimeRoot, id) + L"\\mods"; }
-static std::wstring ProfilesManifestPath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\profiles.txt"; }
+static std::wstring ProfilesJsonPath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\profiles.json"; }
+static std::wstring LegacyProfilesManifestPath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\profiles.txt"; }
 static std::wstring ActiveProfilePath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\active.txt"; }
 
+static std::wstring MakeTargetId(const std::wstring& minecraftVersion, const std::wstring& loader, const std::wstring& loaderVersion) {
+    return minecraftVersion + L"-" + loader + L"-" + (loaderVersion.empty() ? L"none" : loaderVersion);
+}
+
+static LaunchTarget DefaultLaunchTarget() {
+    LaunchTarget t;
+    t.minecraftVersion = kDefaultMinecraftVersionW;
+    t.loader = L"fabric";
+    t.loaderVersion = a2w(kDefaultFabricLoaderVersion);
+    t.targetId = MakeTargetId(t.minecraftVersion, t.loader, t.loaderVersion);
+    t.displayName = t.minecraftVersion + L" Fabric";
+    t.javaRuntime = L"current";
+    t.supportLevel = L"supported";
+    t.notes = L"Current launcher default";
+    return t;
+}
+
+static std::vector<std::wstring> SplitTabs(const std::wstring& line) {
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= line.size()) {
+        const size_t tab = line.find(L'\t', start);
+        parts.push_back(line.substr(start, tab == std::wstring::npos ? std::wstring::npos : tab - start));
+        if (tab == std::wstring::npos) break;
+        start = tab + 1;
+    }
+    return parts;
+}
+
+static std::wstring Capitalize(std::wstring s) {
+    if (!s.empty()) s[0] = static_cast<wchar_t>(towupper(s[0]));
+    return s;
+}
+
+static std::wstring TargetShortText(const LaunchTarget& target) {
+    return target.minecraftVersion + L" / " + Capitalize(target.loader);
+}
+
+static std::wstring TargetProfileText(const LaunchTarget& target) {
+    std::wstring text = TargetShortText(target);
+    if (!target.loaderVersion.empty() && target.loaderVersion != L"none") {
+        text += L" " + target.loaderVersion;
+    }
+    return text;
+}
+
+static bool IsLaunchTargetSupportedByCurrentCode(const LaunchTarget& target) {
+    const LaunchTarget def = DefaultLaunchTarget();
+    return target.targetId == def.targetId &&
+        _wcsicmp(target.loader.c_str(), L"fabric") == 0;
+}
+
+static LaunchTarget TargetFromProfile(const Profile& p) {
+    LaunchTarget t = DefaultLaunchTarget();
+    if (!p.minecraftVersion.empty()) t.minecraftVersion = p.minecraftVersion;
+    if (!p.loader.empty()) t.loader = p.loader;
+    if (!p.loaderVersion.empty()) t.loaderVersion = p.loaderVersion;
+    t.targetId = !p.targetId.empty() ? p.targetId : MakeTargetId(t.minecraftVersion, t.loader, t.loaderVersion);
+    t.displayName = t.minecraftVersion + L" " + Capitalize(t.loader);
+    return t;
+}
+
+static std::vector<LaunchTarget> LoadVersionCatalog(const std::wstring& runtimeRoot) {
+    std::vector<LaunchTarget> out;
+    const std::wstring packageDir = GetExecutableDir();
+    const std::wstring paths[] = {
+        runtimeRoot + L"\\runtime\\version_catalog.tsv",
+        packageDir + L"\\runtime\\version_catalog.tsv"
+    };
+
+    std::wstring body;
+    for (const std::wstring& path : paths) {
+        if (ReadTextFile(path, body)) {
+            WriteLogF(L"Loaded version catalog: %s", path.c_str());
+            break;
+        }
+    }
+
+    if (!body.empty()) {
+        std::wstringstream ss(body);
+        std::wstring line;
+        while (std::getline(ss, line)) {
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            if (line.empty() || line[0] == L'#') continue;
+            std::vector<std::wstring> parts = SplitTabs(line);
+            if (!parts.empty() && parts[0] == L"minecraftVersion") continue;
+            if (parts.size() < 6) continue;
+
+            LaunchTarget t;
+            t.minecraftVersion = parts[0];
+            t.displayName = parts.size() > 1 ? parts[1] : parts[0];
+            t.loader = parts.size() > 2 ? ToLowerW(parts[2]) : L"fabric";
+            t.loaderVersion = parts.size() > 3 ? parts[3] : L"none";
+            t.javaRuntime = parts.size() > 4 ? parts[4] : L"current";
+            t.supportLevel = parts.size() > 5 ? parts[5] : L"testing";
+            t.notes = parts.size() > 6 ? parts[6] : L"";
+            if (t.minecraftVersion.empty() || t.loader.empty()) continue;
+            t.targetId = MakeTargetId(t.minecraftVersion, t.loader, t.loaderVersion);
+            out.push_back(t);
+        }
+    }
+
+    const LaunchTarget def = DefaultLaunchTarget();
+    auto hasDefault = std::find_if(out.begin(), out.end(), [&](const LaunchTarget& t) {
+        return t.targetId == def.targetId;
+    }) != out.end();
+    if (!hasDefault) {
+        out.insert(out.begin(), def);
+    }
+    if (out.empty()) out.push_back(def);
+    return out;
+}
+
+static LaunchTarget ResolveLaunchTarget(const std::wstring& runtimeRoot, const std::wstring& targetId) {
+    const std::vector<LaunchTarget> targets = LoadVersionCatalog(runtimeRoot);
+    for (const LaunchTarget& t : targets) {
+        if (t.targetId == targetId) return t;
+    }
+    return targets.empty() ? DefaultLaunchTarget() : targets.front();
+}
+
+static LaunchTarget ResolveProfileTarget(const std::wstring& runtimeRoot, const Profile& profile) {
+    const std::vector<LaunchTarget> targets = LoadVersionCatalog(runtimeRoot);
+    const std::wstring id = profile.targetId.empty()
+        ? MakeTargetId(profile.minecraftVersion.empty() ? std::wstring(kDefaultMinecraftVersionW) : profile.minecraftVersion,
+                       profile.loader.empty() ? std::wstring(L"fabric") : profile.loader,
+                       profile.loaderVersion.empty() ? a2w(kDefaultFabricLoaderVersion) : profile.loaderVersion)
+        : profile.targetId;
+    for (const LaunchTarget& t : targets) {
+        if (t.targetId == id) return t;
+    }
+    return TargetFromProfile(profile);
+}
+
+static Profile MakeBuiltinVanillaProfile() {
+    const LaunchTarget def = DefaultLaunchTarget();
+    return { kVanillaProfileId, L"Vanilla", def.minecraftVersion, def.loader, def.loaderVersion, def.targetId, true };
+}
+
+static Profile ProfileWithTarget(const std::wstring& id, const std::wstring& name, const LaunchTarget& target, bool builtin) {
+    return { id, name.empty() ? id : StripNewlines(name), target.minecraftVersion, target.loader, target.loaderVersion, target.targetId, builtin };
+}
+
+static std::wstring ReadActiveProfileShim(const std::wstring& runtimeRoot) {
+    std::ifstream f(ActiveProfilePath(runtimeRoot), std::ios::binary);
+    std::string line;
+    if (f && std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        return a2w(line.c_str());
+    }
+    return {};
+}
+
+static std::wstring ReadActiveProfileFromJson(const std::wstring& runtimeRoot) {
+    using namespace winrt::Windows::Data::Json;
+    std::wstring body;
+    if (!ReadTextFile(ProfilesJsonPath(runtimeRoot), body)) return {};
+    try {
+        JsonObject root = JsonObject::Parse(winrt::hstring(body.c_str()));
+        return JsonStringOrEmpty(root, L"activeProfileId");
+    } catch (...) {
+        return {};
+    }
+}
+
+static void SaveProfilesJson(const std::wstring& runtimeRoot, const std::vector<Profile>& profiles, const std::wstring& activeProfileId) {
+    using namespace winrt::Windows::Data::Json;
+    EnsureDirectoryTree(ProfilesRoot(runtimeRoot));
+
+    auto jsonString = [](const std::wstring& value) {
+        return JsonValue::CreateStringValue(winrt::hstring(value.c_str()));
+    };
+
+    JsonObject root;
+    root.SetNamedValue(L"schemaVersion", JsonValue::CreateNumberValue(2));
+    const std::wstring activeId = activeProfileId.empty() ? std::wstring(kVanillaProfileId) : activeProfileId;
+    root.SetNamedValue(L"activeProfileId", jsonString(activeId));
+
+    JsonArray arr;
+    for (const Profile& p : profiles) {
+        JsonObject obj;
+        obj.SetNamedValue(L"id", jsonString(p.id));
+        obj.SetNamedValue(L"name", jsonString(StripNewlines(p.name)));
+        obj.SetNamedValue(L"minecraftVersion", jsonString(p.minecraftVersion));
+        obj.SetNamedValue(L"loader", jsonString(p.loader));
+        obj.SetNamedValue(L"loaderVersion", jsonString(p.loaderVersion));
+        obj.SetNamedValue(L"targetId", jsonString(p.targetId));
+        obj.SetNamedValue(L"builtin", JsonValue::CreateBooleanValue(p.builtin));
+        arr.Append(obj);
+    }
+    root.SetNamedValue(L"profiles", arr);
+
+    const std::wstring text = std::wstring(root.Stringify().c_str());
+    if (!WriteTextFile(ProfilesJsonPath(runtimeRoot), text)) {
+        WriteLogF(L"Failed to write profiles.json err=%u", GetLastError());
+    }
+}
+
 static std::vector<Profile> LoadProfiles(const std::wstring& runtimeRoot) {
+    using namespace winrt::Windows::Data::Json;
     std::vector<Profile> out;
-    out.push_back({ kVanillaProfileId, L"Vanilla", true });
-    std::ifstream f(ProfilesManifestPath(runtimeRoot), std::ios::binary);
+    const LaunchTarget def = DefaultLaunchTarget();
+
+    std::wstring body;
+    if (ReadTextFile(ProfilesJsonPath(runtimeRoot), body)) {
+        try {
+            JsonObject root = JsonObject::Parse(winrt::hstring(body.c_str()));
+            if (root.HasKey(L"profiles") && root.GetNamedValue(L"profiles").ValueType() == JsonValueType::Array) {
+                JsonArray arr = root.GetNamedArray(L"profiles");
+                for (uint32_t i = 0; i < arr.Size(); ++i) {
+                    auto value = arr.GetAt(i);
+                    if (value.ValueType() != JsonValueType::Object) continue;
+                    JsonObject obj = value.GetObject();
+                    Profile p;
+                    p.id = JsonStringOrEmpty(obj, L"id");
+                    p.name = JsonStringOrEmpty(obj, L"name");
+                    p.minecraftVersion = JsonStringOrEmpty(obj, L"minecraftVersion");
+                    p.loader = ToLowerW(JsonStringOrEmpty(obj, L"loader"));
+                    p.loaderVersion = JsonStringOrEmpty(obj, L"loaderVersion");
+                    p.targetId = JsonStringOrEmpty(obj, L"targetId");
+                    p.builtin = JsonBoolOrFalse(obj, L"builtin");
+                    if (p.id.empty()) continue;
+                    if (p.name.empty()) p.name = p.id;
+                    if (p.minecraftVersion.empty()) p.minecraftVersion = def.minecraftVersion;
+                    if (p.loader.empty()) p.loader = def.loader;
+                    if (p.loaderVersion.empty()) p.loaderVersion = def.loaderVersion;
+                    if (p.targetId.empty()) p.targetId = MakeTargetId(p.minecraftVersion, p.loader, p.loaderVersion);
+                    out.push_back(p);
+                }
+            }
+        } catch (const winrt::hresult_error& ex) {
+            WriteLogF(L"profiles.json parse failed hr=0x%08X msg=%s",
+                static_cast<unsigned int>(ex.code()), ex.message().c_str());
+        }
+        if (std::find_if(out.begin(), out.end(), [](const Profile& p) { return p.id == kVanillaProfileId; }) == out.end()) {
+            out.insert(out.begin(), MakeBuiltinVanillaProfile());
+        }
+        if (out.empty()) out.push_back(MakeBuiltinVanillaProfile());
+        return out;
+    }
+
+    out.push_back(MakeBuiltinVanillaProfile());
+    std::ifstream f(LegacyProfilesManifestPath(runtimeRoot), std::ios::binary);
     std::string line;
     while (f && std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -2864,31 +3121,29 @@ static std::vector<Profile> LoadProfiles(const std::wstring& runtimeRoot) {
         const std::wstring id = a2w((tab == std::string::npos ? line : line.substr(0, tab)).c_str());
         const std::wstring name = tab == std::string::npos ? id : a2w(line.substr(tab + 1).c_str());
         if (id.empty() || id == kVanillaProfileId) continue;
-        out.push_back({ id, name.empty() ? id : name, false });
+        out.push_back(ProfileWithTarget(id, name.empty() ? id : name, def, false));
     }
+    const std::wstring active = ReadActiveProfileShim(runtimeRoot);
+    SaveProfilesJson(runtimeRoot, out, active.empty() ? std::wstring(kVanillaProfileId) : active);
     return out;
 }
 
 static void SaveProfiles(const std::wstring& runtimeRoot, const std::vector<Profile>& profiles) {
-    EnsureDirectoryTree(ProfilesRoot(runtimeRoot));
-    std::ofstream f(ProfilesManifestPath(runtimeRoot), std::ios::binary | std::ios::trunc);
-    if (!f) return;
-    for (const auto& p : profiles) {
-        if (p.builtin || p.id == kVanillaProfileId) continue;
-        const std::string body = w2a(p.id) + "\t" + w2a(StripNewlines(p.name)) + "\n";
-        f.write(body.data(), static_cast<std::streamsize>(body.size()));
-    }
+    std::wstring active = ReadActiveProfileFromJson(runtimeRoot);
+    if (active.empty()) active = ReadActiveProfileShim(runtimeRoot);
+    if (active.empty()) active = kVanillaProfileId;
+    SaveProfilesJson(runtimeRoot, profiles, active);
 }
 
 static std::wstring GetActiveProfileId(const std::wstring& runtimeRoot) {
-    std::ifstream f(ActiveProfilePath(runtimeRoot), std::ios::binary);
-    std::string line;
-    if (f && std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const std::wstring id = a2w(line.c_str());
-        if (!id.empty()) {
-            if (id == kVanillaProfileId) return id;
-            if (GetFileAttributesW(ProfileDir(runtimeRoot, id).c_str()) != INVALID_FILE_ATTRIBUTES) return id;
+    const std::wstring jsonActive = ReadActiveProfileFromJson(runtimeRoot);
+    const std::wstring shimActive = ReadActiveProfileShim(runtimeRoot);
+    const std::wstring candidates[] = { jsonActive, shimActive };
+    const std::vector<Profile> profiles = LoadProfiles(runtimeRoot);
+    for (const std::wstring& id : candidates) {
+        if (id.empty()) continue;
+        for (const Profile& p : profiles) {
+            if (p.id == id) return id;
         }
     }
     return kVanillaProfileId;
@@ -2898,6 +3153,7 @@ static void SetActiveProfileId(const std::wstring& runtimeRoot, const std::wstri
     EnsureDirectoryTree(ProfilesRoot(runtimeRoot));
     std::ofstream f(ActiveProfilePath(runtimeRoot), std::ios::binary | std::ios::trunc);
     if (f) { const std::string s = w2a(id); f.write(s.data(), static_cast<std::streamsize>(s.size())); }
+    SaveProfilesJson(runtimeRoot, LoadProfiles(runtimeRoot), id.empty() ? std::wstring(kVanillaProfileId) : id);
 }
 
 static int ProfileModCount(const std::wstring& runtimeRoot, const std::wstring& id) {
@@ -2922,19 +3178,30 @@ static std::wstring MakeProfileId(const std::wstring& runtimeRoot, const std::ws
     return id;
 }
 
-static std::wstring CreateProfile(const std::wstring& runtimeRoot, const std::wstring& name) {
+static Profile GetProfileById(const std::wstring& runtimeRoot, const std::wstring& id) {
+    for (const Profile& p : LoadProfiles(runtimeRoot)) {
+        if (p.id == id) return p;
+    }
+    return MakeBuiltinVanillaProfile();
+}
+
+static std::wstring CreateProfile(const std::wstring& runtimeRoot, const std::wstring& name, const LaunchTarget& target) {
     std::vector<Profile> profiles = LoadProfiles(runtimeRoot);
     const std::wstring id = MakeProfileId(runtimeRoot, name);
     EnsureDirectoryTree(ProfileModsDir(runtimeRoot, id));
-    profiles.push_back({ id, name.empty() ? id : StripNewlines(name), false });
+    profiles.push_back(ProfileWithTarget(id, name.empty() ? id : StripNewlines(name), target, false));
     SaveProfiles(runtimeRoot, profiles);
     return id;
 }
 
-static std::wstring CreateAutoProfile(const std::wstring& runtimeRoot) {
+static std::wstring CreateProfile(const std::wstring& runtimeRoot, const std::wstring& name) {
+    return CreateProfile(runtimeRoot, name, DefaultLaunchTarget());
+}
+
+static std::wstring CreateAutoProfile(const std::wstring& runtimeRoot, const LaunchTarget& target) {
     int n = 1;
     for (const Profile& p : LoadProfiles(runtimeRoot)) if (!p.builtin) ++n;
-    return CreateProfile(runtimeRoot, L"Profile " + std::to_wstring(n));
+    return CreateProfile(runtimeRoot, L"Profile " + std::to_wstring(n) + L" - " + TargetShortText(target), target);
 }
 
 static void DeleteProfile(const std::wstring& runtimeRoot, const std::wstring& id) {
@@ -2955,7 +3222,11 @@ static void RenameProfile(const std::wstring& runtimeRoot, const std::wstring& i
 
 static void EnsureProfilesInitialized(const std::wstring& runtimeRoot) {
     EnsureDirectoryTree(ProfileModsDir(runtimeRoot, kVanillaProfileId));
-    if (GetFileAttributesW(ProfilesManifestPath(runtimeRoot).c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesW(ProfilesJsonPath(runtimeRoot).c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesW(LegacyProfilesManifestPath(runtimeRoot).c_str()) != INVALID_FILE_ATTRIBUTES) {
+        LoadProfiles(runtimeRoot);
+        return;
+    }
 
     const std::wstring legacy = runtimeRoot + L"\\game\\user-mods";
     WIN32_FIND_DATAW fd;
@@ -2963,7 +3234,8 @@ static void EnsureProfilesInitialized(const std::wstring& runtimeRoot) {
     const bool hasLegacy = h != INVALID_HANDLE_VALUE;
 
     std::vector<Profile> profiles;
-    profiles.push_back({ kVanillaProfileId, L"Vanilla", true });
+    const LaunchTarget def = DefaultLaunchTarget();
+    profiles.push_back(MakeBuiltinVanillaProfile());
     if (hasLegacy) {
         const std::wstring id = L"default";
         EnsureDirectoryTree(ProfileModsDir(runtimeRoot, id));
@@ -2973,11 +3245,11 @@ static void EnsureProfilesInitialized(const std::wstring& runtimeRoot) {
                 (ProfileModsDir(runtimeRoot, id) + L"\\" + fd.cFileName).c_str(), MOVEFILE_REPLACE_EXISTING);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
-        profiles.push_back({ id, L"Default", false });
-        SaveProfiles(runtimeRoot, profiles);
+        profiles.push_back(ProfileWithTarget(id, L"Default", def, false));
+        SaveProfilesJson(runtimeRoot, profiles, id);
         SetActiveProfileId(runtimeRoot, id);
     } else {
-        SaveProfiles(runtimeRoot, profiles);
+        SaveProfilesJson(runtimeRoot, profiles, kVanillaProfileId);
         SetActiveProfileId(runtimeRoot, kVanillaProfileId);
     }
 }
@@ -2997,6 +3269,10 @@ static std::vector<std::wstring> ListProfileMods(const std::wstring& runtimeRoot
 static std::wstring ProfileDisplayName(const std::wstring& runtimeRoot, const std::wstring& id) {
     for (const Profile& p : LoadProfiles(runtimeRoot)) if (p.id == id) return p.name;
     return id;
+}
+
+static std::wstring ProfileDisplayTarget(const std::wstring& runtimeRoot, const std::wstring& id) {
+    return TargetProfileText(ResolveProfileTarget(runtimeRoot, GetProfileById(runtimeRoot, id)));
 }
 static void StartInstallJob(const ModCard& card, const std::wstring& runtimeRoot) {
     if (g_installRunning.load()) return;
@@ -3144,9 +3420,14 @@ struct AuthUiState {
     unsigned modsDetailReqId = 0;
     std::wstring activeProfileName;
     std::wstring activeProfileId;
+    std::vector<LaunchTarget> modsTargets;
+    std::wstring modsBrowseTargetId;
+    bool modsTargetOpen = false;
+    int modsTargetSel = 0;
     bool modsProfileOpen = false;
     std::wstring modsProfileId;
     std::wstring modsProfileName;
+    std::wstring modsProfileTargetText;
     bool modsProfileBuiltin = false;
     std::vector<std::wstring> modsProfileMods;
     int modsProfileScroll = 0;
@@ -3160,6 +3441,7 @@ struct AuthUiState {
     QrMatrix qr;
 };
 
+static LaunchTarget CurrentModsTarget(const AuthUiState& state);
 static void ProcessAuthUiEvents();
 
 class AuthScreenRenderer {
@@ -3476,8 +3758,9 @@ public:
                 DrawText(nameShown.c_str(), titleFormat_.Get(),
                     D2D1::RectF(left, top, right - 380.0f, top + 48.0f), state.modsRenaming ? accent.Get() : white.Get());
                 const std::wstring sub = state.modsProfileBuiltin
-                    ? std::wstring(L"Pure vanilla, always available")
-                    : (std::to_wstring(state.modsProfileMods.size()) + (state.modsProfileMods.size() == 1 ? L" mod installed" : L" mods installed"));
+                    ? (state.modsProfileTargetText + L" - Pure vanilla, always available")
+                    : (state.modsProfileTargetText + L" - " + std::to_wstring(state.modsProfileMods.size()) +
+                        (state.modsProfileMods.size() == 1 ? L" mod installed" : L" mods installed"));
                 DrawText(sub.c_str(), captionFormat_.Get(),
                     D2D1::RectF(left, top + 50.0f, right - 380.0f, top + 74.0f), muted.Get());
 
@@ -3631,7 +3914,23 @@ public:
             const D2D1_RECT_F inner = D2D1::RectF(list.left + pad, list.top + pad, list.right - pad, list.bottom - pad);
 
             const float searchH = 46.0f;
-            const D2D1_RECT_F search = D2D1::RectF(inner.left, inner.top, inner.right, inner.top + searchH);
+            const D2D1_RECT_F targetBox = D2D1::RectF(inner.left, inner.top, inner.right, inner.top + searchH);
+            const bool targetFocused = state.modsFocus == 3;
+            if (targetFocused) GlowSelect(targetBox, 12.0f);
+            FillRound(targetBox, targetFocused ? accentSoft.Get() : panel.Get(), 12.0f);
+            StrokeRound(targetBox, targetFocused ? accent.Get() : softEdge.Get(), 12.0f, targetFocused ? 3.0f : 1.0f);
+            DrawIcon(L"\uE8EC", D2D1::RectF(targetBox.left + 8.0f, targetBox.top, targetBox.left + 40.0f, targetBox.bottom), targetFocused ? accent.Get() : muted.Get());
+            {
+                const std::wstring targetText = L"Target: " + TargetProfileText(CurrentModsTarget(state));
+                DrawText(targetText.c_str(), smallMid_.Get(),
+                    D2D1::RectF(targetBox.left + 44.0f, targetBox.top, targetBox.right - 48.0f, targetBox.bottom),
+                    white.Get());
+                DrawText(state.modsTargetOpen ? L"\uE70E" : L"\uE70D", iconFormat_.Get(),
+                    D2D1::RectF(targetBox.right - 42.0f, targetBox.top, targetBox.right - 10.0f, targetBox.bottom),
+                    targetFocused ? accent.Get() : muted.Get());
+            }
+
+            const D2D1_RECT_F search = D2D1::RectF(inner.left, targetBox.bottom + 10.0f, inner.right, targetBox.bottom + 10.0f + searchH);
             const bool searchFocused = state.modsFocus == 1;
             if (searchFocused) GlowSelect(search, 12.0f);
             FillRound(search, searchFocused ? accentSoft.Get() : panel.Get(), 12.0f);
@@ -3728,6 +4027,30 @@ public:
                 DrawText(emptyText.c_str(), bodyFormat_.Get(),
                     D2D1::RectF(inner.left + 8.0f, gridTop + 8.0f, inner.right - 8.0f, gridTop + 70.0f),
                     muted.Get());
+            }
+
+            if (state.modsTargetOpen && !state.modsTargets.empty()) {
+                const float rowH = 40.0f;
+                const int n = static_cast<int>(state.modsTargets.size());
+                const float dropTop = targetBox.bottom + 4.0f;
+                const D2D1_RECT_F drop = D2D1::RectF(targetBox.left, dropTop, targetBox.right, dropTop + rowH * n + 12.0f);
+                FillRound(drop, surfaceFill.Get(), 12.0f);
+                StrokeRound(drop, accent.Get(), 12.0f, 2.0f);
+                for (int i = 0; i < n; ++i) {
+                    const float ry = dropTop + 6.0f + i * rowH;
+                    const D2D1_RECT_F row = D2D1::RectF(drop.left + 6.0f, ry, drop.right - 6.0f, ry + rowH - 4.0f);
+                    const bool rowSel = i == state.modsTargetSel;
+                    const bool rowActive = state.modsTargets[static_cast<size_t>(i)].targetId == state.modsBrowseTargetId;
+                    if (rowSel) FillRound(row, accentSoft.Get(), 8.0f);
+                    DrawText(TargetProfileText(state.modsTargets[static_cast<size_t>(i)]).c_str(), smallMid_.Get(),
+                        D2D1::RectF(row.left + 14.0f, row.top, row.right - 32.0f, row.bottom),
+                        rowSel ? accent.Get() : white.Get());
+                    if (rowActive) {
+                        DrawText(L"\uE73E", iconFormat_.Get(),
+                            D2D1::RectF(row.right - 30.0f, row.top, row.right - 6.0f, row.bottom),
+                            accent.Get());
+                    }
+                }
             }
 
             finishDraw();
@@ -4365,6 +4688,39 @@ static bool FetchRecommendedMods(const std::wstring& runtimeRoot, std::vector<Mo
     return true;
 }
 
+static int ModsTargetIndex(const AuthUiState& state) {
+    for (size_t i = 0; i < state.modsTargets.size(); ++i) {
+        if (state.modsTargets[i].targetId == state.modsBrowseTargetId) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+static LaunchTarget CurrentModsTarget(const AuthUiState& state) {
+    const int idx = ModsTargetIndex(state);
+    if (idx >= 0 && idx < static_cast<int>(state.modsTargets.size())) return state.modsTargets[static_cast<size_t>(idx)];
+    return DefaultLaunchTarget();
+}
+
+static void EnsureModsTargetState(AuthUiState& state, const std::wstring& runtimeRoot) {
+    if (state.modsTargets.empty()) {
+        state.modsTargets = LoadVersionCatalog(runtimeRoot);
+    }
+    if (state.modsBrowseTargetId.empty()) {
+        const Profile active = GetProfileById(runtimeRoot, GetActiveProfileId(runtimeRoot));
+        state.modsBrowseTargetId = ResolveProfileTarget(runtimeRoot, active).targetId;
+    }
+    const int idx = ModsTargetIndex(state);
+    if (idx < 0 || idx >= static_cast<int>(state.modsTargets.size())) {
+        state.modsBrowseTargetId = state.modsTargets.empty() ? DefaultLaunchTarget().targetId : state.modsTargets.front().targetId;
+    }
+}
+
+static void SetModsTargetFromProfile(AuthUiState& state, const std::wstring& runtimeRoot, const std::wstring& profileId) {
+    EnsureModsTargetState(state, runtimeRoot);
+    const Profile profile = GetProfileById(runtimeRoot, profileId);
+    state.modsBrowseTargetId = ResolveProfileTarget(runtimeRoot, profile).targetId;
+}
+
 static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, const std::wstring& userModsDir) {
     state.modsCards.clear();
     state.selectedModIndex = 0;
@@ -4374,6 +4730,7 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
     state.isError = false;
     state.activeProfileId = GetActiveProfileId(runtimeRoot);
     state.activeProfileName = ProfileDisplayName(runtimeRoot, state.activeProfileId);
+    EnsureModsTargetState(state, runtimeRoot);
 
     const std::wstring query = state.modsSearchQuery;
 
@@ -4384,7 +4741,7 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
             ModCard add;
             add.projectId = L"__new__";
             add.title = L"+ New profile";
-            add.description = L"Create an empty profile, then install mods into it";
+            add.description = L"Create " + TargetProfileText(CurrentModsTarget(state)) + L" profile";
             state.modsCards.push_back(add);
         }
         for (const Profile& p : LoadProfiles(runtimeRoot)) {
@@ -4394,11 +4751,12 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
             c.title = p.name;
             const bool isActive = (p.id == active);
             c.installed = isActive;
+            const std::wstring targetText = TargetProfileText(ResolveProfileTarget(runtimeRoot, p));
             if (p.builtin) {
-                c.description = L"Pure vanilla, no mods";
+                c.description = targetText + L" - Pure vanilla, no mods";
             } else {
                 const int n = ProfileModCount(runtimeRoot, p.id);
-                c.description = std::to_wstring(n) + (n == 1 ? L" mod" : L" mods");
+                c.description = targetText + L" - " + std::to_wstring(n) + (n == 1 ? L" mod" : L" mods");
             }
             c.status = isActive ? L"\u25CF Playing this" : L"";
             state.modsCards.push_back(c);
@@ -4709,11 +5067,14 @@ static void ShowModsPage(
     state.selectedModIndex = 0;
     state.modsFocus = 0;
     state.modsScrollRow = 0;
+    state.modsTargetOpen = false;
     state.modsSearchEditing = false;
     state.modsDetailOpen = false;
     state.modsDetailScroll = 0;
     state.modsSearchQuery.clear();
     state.status = L"Loading installed mods";
+    state.modsTargets = LoadVersionCatalog(runtimeRoot);
+    SetModsTargetFromProfile(state, runtimeRoot, GetActiveProfileId(runtimeRoot));
     LoadModsTab(state, runtimeRoot, userModsDir);
 
     StartIconWorker();
@@ -4762,6 +5123,20 @@ static void ShowModsPage(
         if (selRow < state.modsScrollRow) state.modsScrollRow = selRow;
         if (selRow >= state.modsScrollRow + rowsVisible) state.modsScrollRow = selRow - rowsVisible + 1;
         if (state.modsScrollRow < 0) state.modsScrollRow = 0;
+    };
+
+    auto applyTargetIndex = [&](int idx) {
+        EnsureModsTargetState(state, runtimeRoot);
+        if (state.modsTargets.empty()) return;
+        const int total = static_cast<int>(state.modsTargets.size());
+        idx = (idx % total + total) % total;
+        state.modsBrowseTargetId = state.modsTargets[static_cast<size_t>(idx)].targetId;
+        LoadModsTab(state, runtimeRoot, userModsDir);
+        state.modsFocus = 3;
+        state.selectedModIndex = 0;
+        state.modsScrollRow = 0;
+        loadedQuery = state.modsSearchQuery;
+        state.status = L"New profiles will use " + TargetProfileText(CurrentModsTarget(state));
     };
 
     auto loadMore = [&]() {
@@ -4853,7 +5228,7 @@ static void ShowModsPage(
             ABI::Windows::System::VirtualKey_F2
         });
 
-        if (backDown && !backWasDown && !state.modsDetailOpen && !state.modsProfileOpen && !g_installRunning.load()) {
+        if (backDown && !backWasDown && !state.modsDetailOpen && !state.modsProfileOpen && !state.modsTargetOpen && !g_installRunning.load()) {
             WriteLog(L"Mods page closed");
             EndModsSearchCapture();
             StopIconWorker();
@@ -4991,6 +5366,7 @@ static void ShowModsPage(
                     SetActiveProfileId(runtimeRoot, state.modsProfileId);
                     state.activeProfileId = state.modsProfileId;
                     state.activeProfileName = state.modsProfileName;
+                    SetModsTargetFromProfile(state, runtimeRoot, state.modsProfileId);
                     state.status = L"Play will use " + state.modsProfileName;
                 }
             }
@@ -5045,7 +5421,31 @@ static void ShowModsPage(
                 loadedQuery = state.modsSearchQuery;
             }
             if ((rightDown && !rightWasDown) || (selectDown && !selectWasDown)) {
-                enterSearch();
+                state.modsFocus = 3;
+            }
+        } else if (state.modsFocus == 3) {
+            if (state.modsTargetOpen) {
+                const int total = static_cast<int>(state.modsTargets.size());
+                if (upDown && !upWasDown) {
+                    if (total > 0) state.modsTargetSel = (state.modsTargetSel - 1 + total) % total;
+                } else if (downDown && !downWasDown) {
+                    if (total > 0) state.modsTargetSel = (state.modsTargetSel + 1) % total;
+                } else if (backDown && !backWasDown) {
+                    state.modsTargetOpen = false;
+                } else if ((selectDown && !selectWasDown) || (enterDown && !enterWasDown)) {
+                    applyTargetIndex(state.modsTargetSel);
+                    state.modsTargetOpen = false;
+                }
+            } else {
+                if ((selectDown && !selectWasDown) || (enterDown && !enterWasDown)) {
+                    EnsureModsTargetState(state, runtimeRoot);
+                    state.modsTargetSel = (std::max)(0, ModsTargetIndex(state));
+                    state.modsTargetOpen = true;
+                } else if ((leftDown && !leftWasDown) || (upDown && !upWasDown)) {
+                    state.modsFocus = 0;
+                } else if (downDown && !downWasDown) {
+                    enterSearch();
+                }
             }
         } else if (state.modsFocus == 1) {
             if (!state.modsSearchEditing) {
@@ -5053,7 +5453,7 @@ static void ShowModsPage(
                     state.modsSearchEditing = true;
                     ModsSearchBeginInput();
                 } else if ((upDown && !upWasDown) || (leftDown && !leftWasDown)) {
-                    state.modsFocus = 0;
+                    state.modsFocus = 3;
                 } else if (downDown && !downWasDown) {
                     if (!state.modsCards.empty()) {
                         state.modsFocus = 2;
@@ -5071,7 +5471,7 @@ static void ShowModsPage(
                     nextFocus = state.modsCards.empty() ? 1 : 2;
                 } else if ((upDown && !upWasDown) || (leftDown && !leftWasDown)) {
                     leaving = true;
-                    nextFocus = 0;
+                    nextFocus = 3;
                 } else if (downDown && !downWasDown) {
                     leaving = true;
                     nextFocus = state.modsCards.empty() ? 0 : 2;
@@ -5100,7 +5500,7 @@ static void ShowModsPage(
             }
             if (upDown && !upWasDown) {
                 if (state.selectedModIndex < 2) {
-                    enterSearch();
+                    state.modsFocus = 1;
                 } else {
                     state.selectedModIndex -= 2;
                 }
@@ -5148,15 +5548,19 @@ static void ShowModsPage(
                 ModCard selected = state.modsCards[static_cast<size_t>(state.selectedModIndex)];
                 if (state.selectedModsTab == 0) {
                     if (selected.projectId == L"__new__") {
-                        const std::wstring pid = CreateAutoProfile(runtimeRoot);
+                        const LaunchTarget target = CurrentModsTarget(state);
+                        const std::wstring pid = CreateAutoProfile(runtimeRoot, target);
                         SetActiveProfileId(runtimeRoot, pid);
+                        state.modsBrowseTargetId = target.targetId;
                         LoadModsTab(state, runtimeRoot, userModsDir);
                         ensureSelectionVisible();
                         state.status = L"New profile ready. Browse mods to fill it.";
                     } else if (selected.projectId == L"__profile__") {
+                        SetModsTargetFromProfile(state, runtimeRoot, selected.filePath);
                         state.modsProfileOpen = true;
                         state.modsProfileId = selected.filePath;
                         state.modsProfileName = selected.title;
+                        state.modsProfileTargetText = ProfileDisplayTarget(runtimeRoot, selected.filePath);
                         state.modsProfileBuiltin = (selected.filePath == kVanillaProfileId);
                         state.modsProfileMods = ListProfileMods(runtimeRoot, selected.filePath);
                         state.modsProfileScroll = 0;
@@ -5209,7 +5613,13 @@ static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& 
     state.showDeviceCode = false;
     state.showMainMenu = true;
     state.status = L"Signed in as " + a2w(authConfig.username.c_str());
-    state.detail = L"Mods placeholder - no mod manager is wired yet.";
+    EnsureProfilesInitialized(runtimeRoot);
+    {
+        const std::wstring activeId = GetActiveProfileId(runtimeRoot);
+        const Profile activeProfile = GetProfileById(runtimeRoot, activeId);
+        const LaunchTarget activeTarget = ResolveProfileTarget(runtimeRoot, activeProfile);
+        state.detail = L"Active profile: " + activeProfile.name + L" - " + TargetProfileText(activeTarget);
+    }
 
     int selected = 0;
     bool upWasDown = false;
@@ -6432,6 +6842,36 @@ public:
 
             ClearRefreshToken();
             WriteLog(L"Saved Microsoft refresh token cleared by sign out");
+        }
+
+        EnsureProfilesInitialized(exeDir);
+        const Profile selectedProfile = GetProfileById(exeDir, GetActiveProfileId(exeDir));
+        const LaunchTarget selectedTarget = ResolveProfileTarget(exeDir, selectedProfile);
+        WriteLogF(L"Selected profile id=%s name=%s target=%s minecraft=%s loader=%s loaderVersion=%s",
+            selectedProfile.id.c_str(),
+            selectedProfile.name.c_str(),
+            selectedTarget.targetId.c_str(),
+            selectedTarget.minecraftVersion.c_str(),
+            selectedTarget.loader.c_str(),
+            selectedTarget.loaderVersion.c_str());
+        if (!IsLaunchTargetSupportedByCurrentCode(selectedTarget)) {
+            WriteLogF(L"Unsupported launch target: %s. Current launch provider supports only %s",
+                selectedTarget.targetId.c_str(),
+                DefaultLaunchTarget().targetId.c_str());
+            AuthScreenRenderer unsupportedRendererInstance;
+            AuthScreenRenderer* unsupportedRenderer = nullptr;
+            if (unsupportedRendererInstance.Initialize(g_authWindow.Get())) {
+                unsupportedRenderer = &unsupportedRendererInstance;
+            }
+            AuthUiState unsupportedState;
+            RenderPreparationProgress(
+                unsupportedRenderer,
+                unsupportedState,
+                L"Unsupported launch target",
+                (TargetProfileText(selectedTarget) + L" is cataloged, but its launch provider is not implemented yet").c_str(),
+                1.0f);
+            SleepWithAuthUi(unsupportedRenderer, unsupportedState, 8000);
+            return E_FAIL;
         }
 
         if (exeDir != packageDir && !IsLocalRuntimeSeedCurrent(packageDir, exeDir)) {

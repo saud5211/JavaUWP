@@ -10,6 +10,14 @@
 
 #pragma once
 
+static constexpr wchar_t kDefaultMinecraftVersionW[] = L"@@MC_VERSION@@";
+static constexpr char    kDefaultMinecraftVersion[]  = "@@MC_VERSION@@";
+static constexpr char    kDefaultFabricLoaderVersion[] = "@@FABRIC_LOADER_VERSION@@";
+static constexpr char    kDefaultFabricLaunchVersion[] = "fabric-loader-@@FABRIC_LOADER_VERSION@@-@@MC_VERSION@@";
+static constexpr char    kDefaultMinecraftAssetIndex[] = "@@MC_ASSET_INDEX@@";
+
+// Compatibility aliases while the launcher is moved from one compile-time
+// Minecraft version to profile-owned launch targets.
 static constexpr wchar_t kMinecraftVersionW[] = L"@@MC_VERSION@@";
 static constexpr char    kMinecraftVersion[]  = "@@MC_VERSION@@";
 static constexpr char    kFabricLoaderVersion[] = "@@FABRIC_LOADER_VERSION@@";

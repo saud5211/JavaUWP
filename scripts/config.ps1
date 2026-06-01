@@ -9,6 +9,9 @@
 #   MC_ASSET_INDEX          -> MinecraftAssetIndex
 #   FABRIC_LOADER_VERSION   -> FabricLoaderVersion
 $ProjectConfig = [ordered]@{
+    DefaultMinecraftVersion  = if ($env:DEFAULT_MC_VERSION)    { $env:DEFAULT_MC_VERSION }    else { "1.21.11" }
+    DefaultLoader            = if ($env:DEFAULT_MC_LOADER)     { $env:DEFAULT_MC_LOADER }     else { "fabric" }
+    VersionCatalog           = if ($env:VERSION_CATALOG)       { $env:VERSION_CATALOG }       else { "config/versions.tsv" }
     MinecraftVersion         = if ($env:MC_VERSION)            { $env:MC_VERSION }            else { "1.21.11" }
     MinecraftAssetIndex      = if ($env:MC_ASSET_INDEX)        { $env:MC_ASSET_INDEX }        else { "29" }
     FabricLoaderVersion      = if ($env:FABRIC_LOADER_VERSION) { $env:FABRIC_LOADER_VERSION } else { "0.19.2" }
