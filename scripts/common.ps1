@@ -82,7 +82,7 @@ function Get-JavaHomeCandidates {
     )
 
     $candidates = @()
-    foreach ($envName in @("JAVA${MajorVersion}_HOME", "JDK${MajorVersion}_HOME")) {
+    foreach ($envName in @("JAVA${MajorVersion}_HOME", "JDK${MajorVersion}_HOME", "JAVA_HOME_${MajorVersion}_X64")) {
         $value = [Environment]::GetEnvironmentVariable($envName)
         if ($value) {
             $candidates += Get-Item $value -ErrorAction SilentlyContinue
