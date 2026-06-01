@@ -46,8 +46,7 @@ if ($MinecraftVersion -eq $ProjectConfig.MinecraftVersion) {
     $disabledMixins += "ZipFsBypass121Mixin"
 } else {
     $disabledMixins += @(
-        "WorldLoadProgressTrackerMixin",
-        "SystemDetailsOshiBypassMixin"
+        "WorldLoadProgressTrackerMixin"
     )
     if ($MinecraftVersion -eq "1.21.1") {
         $disabledMixins += "ZipFsBypassMixin"
@@ -57,13 +56,28 @@ if ($MinecraftVersion -eq $ProjectConfig.MinecraftVersion) {
         $disabledMixins += @("MinecraftClientProbeMixin", "PathUtilBypassMixin", "ZipFsBypassMixin", "ZipFsBypass121Mixin")
     }
 }
+
+$hasSystemDetailsClass = (& $jar tf $clientJar | Select-String -SimpleMatch "net/minecraft/class_6396.class" -Quiet)
+if (-not $hasSystemDetailsClass) {
+    $disabledMixins += "SystemDetailsOshiBypassMixin"
+}
+
 $sources = @($sources | Where-Object {
     $name = [System.IO.Path]::GetFileNameWithoutExtension($_)
     $disabledMixins -notcontains $name
 })
 if (-not $sources) { throw "No compatibility mod sources found" }
 
-$cp = @($clientJar, $mixinJar) -join ";"
+$compileJars = @($clientJar, $mixinJar)
+$oshiJar = Get-ChildItem -LiteralPath (Join-Path $gameDir "libraries\com\github\oshi\oshi-core") -Recurse -Filter "oshi-core-*.jar" -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1
+if ($oshiJar) {
+    $compileJars += $oshiJar.FullName
+} else {
+    Write-Warning "OSHI jar not found in cache; SystemDetailsOshiBypassMixin may fail to compile."
+}
+$cp = $compileJars -join ";"
 $javaRelease = if ($MinecraftVersion -eq $ProjectConfig.MinecraftVersion) { 21 } else { 8 }
 & $javac --release $javaRelease -proc:none -cp $cp -d $classesDir $sources
 if ($LASTEXITCODE -ne 0) { throw "compatibility mod compile failed" }

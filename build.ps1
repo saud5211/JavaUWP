@@ -38,6 +38,7 @@ $glfwBuildDir = Join-Path $buildDir "glfw_shim"
 $mcExe = Join-Path $mcBuildDir "MC.Xbox.exe"
 $shimDll = Join-Path $glfwBuildDir "glfw.dll"
 $jreSrc = Resolve-JavaHome
+$jre21Src = Resolve-JavaHomeExact -MajorVersion 21
 $jarExe = Join-Path $jreSrc "bin\jar.exe"
 if (-not (Test-Path $jarExe)) { $jarExe = "jar" }
 $pythonExe = Resolve-Python
@@ -382,6 +383,83 @@ function Ensure-FabricLoaderJar {
     Write-Host "Packaged patched Fabric loader $LoaderVersion"
 }
 
+function Ensure-TinyRemapperJar {
+    param([Parameter(Mandatory = $true)][string]$TinyRemapperVersion)
+
+    $tinyRelative = "net\fabricmc\tiny-remapper\$TinyRemapperVersion\tiny-remapper-$TinyRemapperVersion.jar"
+    $tinySrc = Join-Path $gameDir "libraries\$tinyRelative"
+    if (-not (Test-Path $tinySrc)) {
+        $tinyUrl = "https://maven.fabricmc.net/net/fabricmc/tiny-remapper/$TinyRemapperVersion/tiny-remapper-$TinyRemapperVersion.jar"
+        Write-Host "Downloading TinyRemapper $TinyRemapperVersion"
+        New-Item -ItemType Directory -Force -Path (Split-Path $tinySrc -Parent) | Out-Null
+        Invoke-WebRequest -UseBasicParsing -Uri $tinyUrl -OutFile $tinySrc -TimeoutSec 60
+    }
+
+    Write-Host "Patching TinyRemapper $TinyRemapperVersion for Xbox filesystem..."
+    $java = Resolve-JavaHome
+    $jarExe = Join-Path $java "bin\jar.exe"
+    $tmp = Join-Path $buildDir "patch-tinyremapper\$TinyRemapperVersion"
+    $srcTmp = Join-Path $tmp "src\net\fabricmc\tinyremapper"
+    $classesTmp = Join-Path $tmp "classes"
+    $jarTmp = Join-Path $tmp "jar"
+    $patchedTiny = Join-Path $tmp "tiny-remapper-$TinyRemapperVersion-patched.jar"
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $srcTmp, $classesTmp, $jarTmp | Out-Null
+
+    foreach ($name in @("FileSystemReference.java", "FileSystemHandler.java", "OutputConsumerPath.java")) {
+        $sourcePath = Join-Path $root "patch\$name"
+        $sourceText = [System.IO.File]::ReadAllText($sourcePath)
+        $sourceText = $sourceText.Replace(
+            "package net.fabricmc.loader.impl.lib.tinyremapper;",
+            "package net.fabricmc.tinyremapper;")
+        [System.IO.File]::WriteAllText((Join-Path $srcTmp $name), $sourceText)
+    }
+
+    & (Join-Path $java "bin\javac.exe") --release 21 -cp $tinySrc -d $classesTmp `
+        (Join-Path $srcTmp "FileSystemReference.java") `
+        (Join-Path $srcTmp "FileSystemHandler.java") `
+        (Join-Path $srcTmp "OutputConsumerPath.java")
+    if ($LASTEXITCODE -ne 0) { throw "TinyRemapper patch compile failed for $TinyRemapperVersion" }
+
+    Push-Location $jarTmp
+    & $jarExe xf $tinySrc
+    Pop-Location
+    if ($LASTEXITCODE -ne 0) { throw "TinyRemapper JAR extract failed for $TinyRemapperVersion" }
+
+    $classFiles = Get-ChildItem -LiteralPath $classesTmp -Recurse -Filter "*.class"
+    foreach ($classFile in $classFiles) {
+        $relativePath = $classFile.FullName.Substring($classesTmp.Length).TrimStart('\', '/')
+        $dst = Join-Path $jarTmp $relativePath
+        New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
+        Copy-Item -LiteralPath $classFile.FullName -Destination $dst -Force
+        Write-Host "  injected $($relativePath.Replace('\', '/'))"
+    }
+
+    $metaInf = Join-Path $jarTmp "META-INF"
+    if (Test-Path $metaInf) {
+        Get-ChildItem -LiteralPath $metaInf -File |
+            Where-Object { $_.Name -match '\.(SF|RSA|DSA|EC)$' } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+    }
+    $manifest = Join-Path $jarTmp "META-INF\MANIFEST.MF"
+    $manifestCopy = Join-Path $tmp "MANIFEST.MF"
+    if (Test-Path $manifest) {
+        Copy-Item -LiteralPath $manifest -Destination $manifestCopy -Force
+        Remove-Item -LiteralPath $manifest -Force
+    }
+    if (Test-Path $manifestCopy) {
+        & $jarExe cfm $patchedTiny $manifestCopy -C $jarTmp .
+    } else {
+        & $jarExe cf $patchedTiny -C $jarTmp .
+    }
+    if ($LASTEXITCODE -ne 0) { throw "TinyRemapper JAR repack failed for $TinyRemapperVersion" }
+
+    $tinyDst = Join-Path $pkg "runtime\libraries\$tinyRelative"
+    New-Item -ItemType Directory -Force -Path (Split-Path $tinyDst -Parent) | Out-Null
+    Copy-Item $patchedTiny $tinyDst -Force
+    Write-Host "Packaged patched TinyRemapper $TinyRemapperVersion"
+}
+
 $fabricTargets = @(
     Import-Csv -Path $versionCatalogSource -Delimiter "`t" |
         Where-Object { $_.loader -eq "fabric" -and $_.loaderVersion -and $_.loaderVersion -ne "selected" -and $_.loaderVersion -ne "none" }
@@ -398,6 +476,9 @@ foreach ($loaderVersion in $fabricLoaderVersions) {
         }
         Write-Warning "Skipping patched Fabric loader ${loaderVersion}: $($_.Exception.Message)"
     }
+}
+if ($fabricLoaderVersions -contains "0.14.25") {
+    Ensure-TinyRemapperJar -TinyRemapperVersion "0.8.2"
 }
 # Bundled mods (compat mod, optionally diagnostics) live under runtime\bundled-mods.
 # App.cpp copies them into LocalState\game\mods on launch.
@@ -529,52 +610,224 @@ if (Test-Path $screenshotSource) {
     Write-Host "Copied menu screenshot assets from $screenshotSource"
 }
 
+function Copy-PackagedJre {
+    param(
+        [Parameter(Mandatory = $true)][string]$JavaHome,
+        [Parameter(Mandatory = $true)][string]$PackageRelativeDir,
+        [Parameter(Mandatory = $true)][string]$SecurityPropertiesPath
+    )
+
+    $dest = Join-Path $pkg $PackageRelativeDir
+    Write-Host "Copying JRE ($PackageRelativeDir)..."
+    Write-Host "JRE source: $JavaHome"
+    Copy-Item -Recurse $JavaHome $dest
+    Copy-Item $SecurityPropertiesPath (Join-Path $dest "conf\security\xbox.properties") -Force
+    Copy-Item $SecurityPropertiesPath (Join-Path $dest "conf\security\java.security") -Force
+}
+
+function Build-JavaSecurityRealpathPatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$JavaHome,
+        [Parameter(Mandatory = $true)][string]$OutputJar,
+        [Parameter(Mandatory = $true)][string]$WorkName
+    )
+
+    Write-Host "Building Java security realpath patch: $OutputJar"
+    $javacExe = Join-Path $JavaHome "bin\javac.exe"
+    if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; Java security patch requires a JDK, not a JRE." }
+    $runtimeJarExe = Join-Path $JavaHome "bin\jar.exe"
+    if (-not (Test-Path $runtimeJarExe)) { $runtimeJarExe = $jarExe }
+    $srcZip = Join-Path $JavaHome "lib\src.zip"
+    if (-not (Test-Path $srcZip)) { throw "JDK source archive not found at $srcZip; Java security patch cannot be generated." }
+    $javaSecurityPatchDir = Join-Path $buildDir $WorkName
+    $javaSecurityPatchSrcDir = Join-Path $javaSecurityPatchDir "src"
+    $javaSecurityPatchClassesDir = Join-Path $javaSecurityPatchDir "classes"
+    Remove-Item -Recurse -Force $javaSecurityPatchDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path `
+        (Join-Path $javaSecurityPatchSrcDir "java\io"), `
+        (Join-Path $javaSecurityPatchSrcDir "java\security"), `
+        (Join-Path $javaSecurityPatchSrcDir "sun\nio\fs"), `
+        $javaSecurityPatchClassesDir | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $srcArchive = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
+    try {
+        $securityEntry = $srcArchive.Entries | Where-Object { $_.FullName -eq "java.base/java/security/Security.java" } | Select-Object -First 1
+        if (-not $securityEntry) { throw "Security.java not found inside $srcZip" }
+        $reader = [System.IO.StreamReader]::new($securityEntry.Open())
+        try {
+            $securitySource = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+
+        $fileEntry = $srcArchive.Entries | Where-Object { $_.FullName -eq "java.base/java/io/File.java" } | Select-Object -First 1
+        if (-not $fileEntry) { throw "File.java not found inside $srcZip" }
+        $reader = [System.IO.StreamReader]::new($fileEntry.Open())
+        try {
+            $fileSource = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+
+        $windowsPathEntry = $srcArchive.Entries | Where-Object { $_.FullName -eq "java.base/sun/nio/fs/WindowsPath.java" } | Select-Object -First 1
+        if (-not $windowsPathEntry) { throw "WindowsPath.java not found inside $srcZip" }
+        $reader = [System.IO.StreamReader]::new($windowsPathEntry.Open())
+        try {
+            $windowsPathSource = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $srcArchive.Dispose()
+    }
+    $oldSecurityLine = "path = path.toRealPath();"
+    $newSecurityLine = "try { path = path.toRealPath(); } catch (IOException realPathFailure) { path = path.toAbsolutePath(); }"
+    $javaBasePatchSources = @()
+    if (-not $securitySource.Contains($oldSecurityLine)) {
+        Write-Warning "Security.java patch target not found for $JavaHome; continuing with WindowsPath realpath patch only."
+    } else {
+        $securitySource = $securitySource.Replace($oldSecurityLine, $newSecurityLine)
+        $securitySourcePath = Join-Path $javaSecurityPatchSrcDir "java\security\Security.java"
+        [System.IO.File]::WriteAllText($securitySourcePath, $securitySource)
+        $javaBasePatchSources += $securitySourcePath
+    }
+
+    $oldFileLine = "            int nameMax = FS.getNameMax(dir.getPath());"
+    $newFileBlock = @'
+            int nameMax;
+            try {
+                nameMax = FS.getNameMax(dir.getPath());
+            } catch (Throwable nameMaxFailure) {
+                nameMax = 255;
+            }
+'@
+    if (-not $fileSource.Contains($oldFileLine)) {
+        throw "File.java temp-file nameMax patch target not found for $JavaHome."
+    }
+    $fileSource = $fileSource.Replace($oldFileLine, $newFileBlock)
+    $fileSourcePath = Join-Path $javaSecurityPatchSrcDir "java\io\File.java"
+    [System.IO.File]::WriteAllText($fileSourcePath, $fileSource)
+    $javaBasePatchSources += $fileSourcePath
+
+    $oldWindowsPathBlock = @'
+        String rp = WindowsLinkSupport.getRealPath(this, Util.followLinks(options));
+        return createFromNormalizedPath(getFileSystem(), rp);
+'@
+    $newWindowsPathBlock = @'
+        try {
+            String rp = WindowsLinkSupport.getRealPath(this, Util.followLinks(options));
+            return createFromNormalizedPath(getFileSystem(), rp);
+        } catch (IOException realPathFailure) {
+            return (WindowsPath)toAbsolutePath().normalize();
+        }
+'@
+    if (-not $windowsPathSource.Contains($oldWindowsPathBlock)) {
+        throw "WindowsPath.java realpath patch target not found for $JavaHome."
+    }
+    $windowsPathSource = $windowsPathSource.Replace($oldWindowsPathBlock, $newWindowsPathBlock)
+    $windowsPathSourcePath = Join-Path $javaSecurityPatchSrcDir "sun\nio\fs\WindowsPath.java"
+    [System.IO.File]::WriteAllText($windowsPathSourcePath, $windowsPathSource)
+    $javaBasePatchSources += $windowsPathSourcePath
+
+    & $javacExe --patch-module "java.base=$javaSecurityPatchSrcDir" -d $javaSecurityPatchClassesDir $javaBasePatchSources
+    if ($LASTEXITCODE -ne 0) { throw "Java security patch compile failed" }
+    Push-Location $javaSecurityPatchClassesDir
+    & $runtimeJarExe cf $OutputJar .
+    Pop-Location
+    if ($LASTEXITCODE -ne 0) { throw "Java security patch jar creation failed" }
+    Write-Host "Java security patch: $OutputJar"
+}
+
+function Build-JavaZipfsRealpathPatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$JavaHome,
+        [Parameter(Mandatory = $true)][string]$OutputJar,
+        [Parameter(Mandatory = $true)][string]$WorkName
+    )
+
+    Write-Host "Building Java ZipFS realpath patch: $OutputJar"
+    $javacExe = Join-Path $JavaHome "bin\javac.exe"
+    if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; Java ZipFS patch requires a JDK, not a JRE." }
+    $runtimeJarExe = Join-Path $JavaHome "bin\jar.exe"
+    if (-not (Test-Path $runtimeJarExe)) { $runtimeJarExe = $jarExe }
+    $srcZip = Join-Path $JavaHome "lib\src.zip"
+    if (-not (Test-Path $srcZip)) { throw "JDK source archive not found at $srcZip; Java ZipFS patch cannot be generated." }
+
+    $zipfsPatchDir = Join-Path $buildDir $WorkName
+    $zipfsPatchSrcDir = Join-Path $zipfsPatchDir "src"
+    $zipfsPatchClassesDir = Join-Path $zipfsPatchDir "classes"
+    Remove-Item -Recurse -Force $zipfsPatchDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path (Join-Path $zipfsPatchSrcDir "jdk\nio\zipfs"), $zipfsPatchClassesDir | Out-Null
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $srcArchive = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
+    try {
+        $providerEntry = $srcArchive.Entries | Where-Object { $_.FullName -eq "jdk.zipfs/jdk/nio/zipfs/ZipFileSystemProvider.java" } | Select-Object -First 1
+        if (-not $providerEntry) { throw "ZipFileSystemProvider.java not found inside $srcZip" }
+        $reader = [System.IO.StreamReader]::new($providerEntry.Open())
+        try {
+            $providerSource = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $srcArchive.Dispose()
+    }
+
+    $providerSource = $providerSource.Replace("uriToPath(uri).toRealPath()", "safeRealPath(uriToPath(uri))")
+    $providerSource = $providerSource.Replace("zfpath.toRealPath()", "safeRealPath(zfpath)")
+    $providerSource = $providerSource.Replace("PrivilegedExceptionAction<Path> action = tempPath::toRealPath;", "PrivilegedExceptionAction<Path> action = () -> safeRealPath(tempPath);")
+    $providerSource = $providerSource.Replace("path.toRealPath()", "safeRealPath(path)")
+
+    $helper = @'
+    private static Path safeRealPath(Path path) throws IOException {
+        try {
+            return path.toRealPath();
+        } catch (IOException realPathFailure) {
+            return path.toAbsolutePath().normalize();
+        }
+    }
+
+'@
+    $insertAfter = "    }`r`n`r`n    @Override`r`n    public FileSystem newFileSystem"
+    if (-not $providerSource.Contains($insertAfter)) {
+        $insertAfter = "    }`n`n    @Override`n    public FileSystem newFileSystem"
+    }
+    if (-not $providerSource.Contains($insertAfter)) {
+        throw "ZipFileSystemProvider.java patch insert point not found."
+    }
+    $insertIndex = $providerSource.IndexOf($insertAfter)
+    if ($insertIndex -lt 0) {
+        throw "ZipFileSystemProvider.java patch insert point not found."
+    }
+    $replacement = "    }`r`n`r`n$helper    @Override`r`n    public FileSystem newFileSystem"
+    $providerSource = $providerSource.Substring(0, $insertIndex) + $replacement + $providerSource.Substring($insertIndex + $insertAfter.Length)
+
+    if ($providerSource -notmatch "safeRealPath\(path\)" -or
+        $providerSource -match "uriToPath\(uri\)\.toRealPath\(\)|zfpath\.toRealPath\(\)|tempPath::toRealPath") {
+        throw "ZipFileSystemProvider.java realpath patch did not apply cleanly."
+    }
+
+    $providerSourcePath = Join-Path $zipfsPatchSrcDir "jdk\nio\zipfs\ZipFileSystemProvider.java"
+    [System.IO.File]::WriteAllText($providerSourcePath, $providerSource)
+    & $javacExe --patch-module "jdk.zipfs=$zipfsPatchSrcDir" -d $zipfsPatchClassesDir $providerSourcePath
+    if ($LASTEXITCODE -ne 0) { throw "Java ZipFS patch compile failed" }
+    Push-Location $zipfsPatchClassesDir
+    & $runtimeJarExe cf $OutputJar .
+    Pop-Location
+    if ($LASTEXITCODE -ne 0) { throw "Java ZipFS patch jar creation failed" }
+    Write-Host "Java ZipFS patch: $OutputJar"
+}
+
 Write-Host "Copying JRE..."
-Write-Host "JRE source: $jreSrc"
-Copy-Item -Recurse $jreSrc (Join-Path $pkg "jre")
 $xboxSecurityProperties = Join-Path $root "xbox_security.properties"
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "xbox_security.properties") -Force
-Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\xbox.properties") -Force
-Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\java.security") -Force
-
-Write-Host "Building Java security realpath patch..."
-$javacExe = Join-Path $jreSrc "bin\javac.exe"
-if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; Java security patch requires a JDK, not a JRE." }
-$srcZip = Join-Path $jreSrc "lib\src.zip"
-if (-not (Test-Path $srcZip)) { throw "JDK source archive not found at $srcZip; Java security patch cannot be generated." }
-$javaSecurityPatchDir = Join-Path $buildDir "java_security_realpath_patch"
-$javaSecurityPatchSrcDir = Join-Path $javaSecurityPatchDir "src"
-$javaSecurityPatchClassesDir = Join-Path $javaSecurityPatchDir "classes"
-$javaSecurityPatchJar = Join-Path $pkg "java-base-security-realpath.jar"
-Remove-Item -Recurse -Force $javaSecurityPatchDir -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path (Join-Path $javaSecurityPatchSrcDir "java\security"), $javaSecurityPatchClassesDir | Out-Null
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$srcArchive = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
-try {
-    $securityEntry = $srcArchive.Entries | Where-Object { $_.FullName -eq "java.base/java/security/Security.java" } | Select-Object -First 1
-    if (-not $securityEntry) { throw "Security.java not found inside $srcZip" }
-    $reader = [System.IO.StreamReader]::new($securityEntry.Open())
-    try {
-        $securitySource = $reader.ReadToEnd()
-    } finally {
-        $reader.Dispose()
-    }
-} finally {
-    $srcArchive.Dispose()
-}
-$oldSecurityLine = "path = path.toRealPath();"
-$newSecurityLine = "try { path = path.toRealPath(); } catch (IOException realPathFailure) { path = path.toAbsolutePath(); }"
-if (-not $securitySource.Contains($oldSecurityLine)) { throw "Security.java patch target not found." }
-$securitySource = $securitySource.Replace($oldSecurityLine, $newSecurityLine)
-$securitySourcePath = Join-Path $javaSecurityPatchSrcDir "java\security\Security.java"
-[System.IO.File]::WriteAllText($securitySourcePath, $securitySource)
-& $javacExe --patch-module "java.base=$javaSecurityPatchSrcDir" -d $javaSecurityPatchClassesDir $securitySourcePath
-if ($LASTEXITCODE -ne 0) { throw "Java security patch compile failed" }
-Push-Location $javaSecurityPatchClassesDir
-& $jarExe cf $javaSecurityPatchJar .
-Pop-Location
-if ($LASTEXITCODE -ne 0) { throw "Java security patch jar creation failed" }
-Write-Host "Java security patch: $javaSecurityPatchJar"
+Copy-PackagedJre -JavaHome $jreSrc -PackageRelativeDir "jre" -SecurityPropertiesPath $xboxSecurityProperties
+Copy-PackagedJre -JavaHome $jre21Src -PackageRelativeDir "jre21" -SecurityPropertiesPath $xboxSecurityProperties
+Build-JavaSecurityRealpathPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-base-security-realpath.jar") -WorkName "java_security_realpath_patch_current"
+Build-JavaSecurityRealpathPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-base-security-realpath-21.jar") -WorkName "java_security_realpath_patch_21"
+Build-JavaZipfsRealpathPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-zipfs-realpath.jar") -WorkName "java_zipfs_realpath_patch_current"
+Build-JavaZipfsRealpathPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-zipfs-realpath-21.jar") -WorkName "java_zipfs_realpath_patch_21"
 
 Write-Host "Generating UWP tile assets..."
 & $pythonExe (Join-Path $root "scripts\generate-assets.py") $pkg

@@ -6,19 +6,16 @@ function Resolve-RepoRoot {
     return (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
 
-function Test-JavaHomeMinimumVersion {
+function Get-JavaHomeMajorVersion {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$JavaHome,
-
-        [Parameter(Mandatory = $true)]
-        [int]$MajorVersion
+        [string]$JavaHome
     )
 
     $javaExe = Join-Path $JavaHome "bin\java.exe"
     $javacExe = Join-Path $JavaHome "bin\javac.exe"
     if (-not (Test-Path $javaExe) -or -not (Test-Path $javacExe)) {
-        return $false
+        return $null
     }
 
     # java -version writes to stderr, and $ErrorActionPreference = 'Stop' in
@@ -31,31 +28,66 @@ function Test-JavaHomeMinimumVersion {
         $ErrorActionPreference = 'Continue'
         $versionOutput = (& $javaExe -version 2>&1 | Select-Object -First 1).ToString()
     } catch {
-        return $false
+        return $null
     } finally {
         $ErrorActionPreference = $prevPref
     }
-    if ($versionOutput -match '"(?<major>\d+)(\.|")') {
-        return ([int]$Matches.major -ge $MajorVersion)
+    if ($versionOutput -match '"(?<major>\d+)(?:\.(?<minor>\d+))?') {
+        $major = [int]$Matches.major
+        if ($major -eq 1 -and $Matches.minor) {
+            return [int]$Matches.minor
+        }
+        return $major
     }
 
-    return $false
+    return $null
 }
 
-function Resolve-JavaHome {
+function Test-JavaHomeMinimumVersion {
     param(
-        [int]$MajorVersion = $ProjectConfig.JavaRelease
+        [Parameter(Mandatory = $true)]
+        [string]$JavaHome,
+
+        [Parameter(Mandatory = $true)]
+        [int]$MajorVersion
     )
 
-    if ($env:JAVA_HOME) {
-        if (Test-JavaHomeMinimumVersion -JavaHome $env:JAVA_HOME -MajorVersion $MajorVersion) {
-            return $env:JAVA_HOME
-        }
-
-        Write-Warning "JAVA_HOME is set but is older than JDK ${MajorVersion}: $env:JAVA_HOME"
+    $major = Get-JavaHomeMajorVersion -JavaHome $JavaHome
+    if ($null -eq $major) {
+        return $false
     }
+    return ($major -ge $MajorVersion)
+}
+
+function Test-JavaHomeExactVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$JavaHome,
+
+        [Parameter(Mandatory = $true)]
+        [int]$MajorVersion
+    )
+
+    $major = Get-JavaHomeMajorVersion -JavaHome $JavaHome
+    if ($null -eq $major) {
+        return $false
+    }
+    return ($major -eq $MajorVersion)
+}
+
+function Get-JavaHomeCandidates {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$MajorVersion
+    )
 
     $candidates = @()
+    foreach ($envName in @("JAVA${MajorVersion}_HOME", "JDK${MajorVersion}_HOME")) {
+        $value = [Environment]::GetEnvironmentVariable($envName)
+        if ($value) {
+            $candidates += Get-Item $value -ErrorAction SilentlyContinue
+        }
+    }
 
     $directRoots = @(
         "C:\ms-jdk$MajorVersion",
@@ -78,12 +110,52 @@ function Resolve-JavaHome {
             Where-Object {
                 $_.Name -like "graalvm-community-openjdk-*" -or
                 $_.Name -like "jdk-$MajorVersion*" -or
+                $_.Name -like "jdk$MajorVersion*" -or
                 $_.Name -like "msopenjdk-$MajorVersion*" -or
                 $_.Name -like "microsoft-jdk-$MajorVersion*"
             }
     }
 
+    return @($candidates | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Resolve-JavaHomeExact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$MajorVersion
+    )
+
+    $candidates = @()
+    if ($env:JAVA_HOME) {
+        $candidates += Get-Item $env:JAVA_HOME -ErrorAction SilentlyContinue
+    }
+    $candidates += Get-JavaHomeCandidates -MajorVersion $MajorVersion
+
     $match = $candidates |
+        Where-Object { Test-JavaHomeExactVersion -JavaHome $_.FullName -MajorVersion $MajorVersion } |
+        Select-Object -First 1
+
+    if ($match) {
+        return $match.FullName
+    }
+
+    throw "No exact Java $MajorVersion installation found. Set JAVA${MajorVersion}_HOME or JDK${MajorVersion}_HOME to a JDK $MajorVersion install."
+}
+
+function Resolve-JavaHome {
+    param(
+        [int]$MajorVersion = $ProjectConfig.JavaRelease
+    )
+
+    if ($env:JAVA_HOME) {
+        if (Test-JavaHomeMinimumVersion -JavaHome $env:JAVA_HOME -MajorVersion $MajorVersion) {
+            return $env:JAVA_HOME
+        }
+
+        Write-Warning "JAVA_HOME is set but is older than JDK ${MajorVersion}: $env:JAVA_HOME"
+    }
+
+    $match = Get-JavaHomeCandidates -MajorVersion $MajorVersion |
         Where-Object { Test-JavaHomeMinimumVersion -JavaHome $_.FullName -MajorVersion $MajorVersion } |
         Select-Object -First 1
 

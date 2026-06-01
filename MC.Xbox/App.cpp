@@ -258,7 +258,7 @@ static bool WriteTextFile(const std::wstring& path, const std::wstring& value) {
 }
 
 static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
-    return std::wstring(L"seedVersion=3\n") +
+    return std::wstring(L"seedVersion=4\n") +
         L"packageDir=" + packageDir + L"\n" +
         L"exe=" + FileStamp(packageDir + L"\\MC.Xbox.exe") + L"\n" +
         L"manifest=" + FileStamp(packageDir + L"\\AppxManifest.xml") + L"\n" +
@@ -268,6 +268,11 @@ static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
         L"jreRelease=" + FileStamp(packageDir + L"\\jre\\release") + L"\n" +
         L"jvm=" + FileStamp(packageDir + L"\\jre\\bin\\server\\jvm.dll") + L"\n" +
         L"securityPatch=" + FileStamp(packageDir + L"\\java-base-security-realpath.jar") + L"\n" +
+        L"zipfsPatch=" + FileStamp(packageDir + L"\\java-zipfs-realpath.jar") + L"\n" +
+        L"jre21Release=" + FileStamp(packageDir + L"\\jre21\\release") + L"\n" +
+        L"jvm21=" + FileStamp(packageDir + L"\\jre21\\bin\\server\\jvm.dll") + L"\n" +
+        L"securityPatch21=" + FileStamp(packageDir + L"\\java-base-security-realpath-21.jar") + L"\n" +
+        L"zipfsPatch21=" + FileStamp(packageDir + L"\\java-zipfs-realpath-21.jar") + L"\n" +
         L"patchedFabricLoader=" + FileStamp(packageDir + L"\\runtime\\libraries\\net\\fabricmc\\fabric-loader\\" + a2w(kFabricLoaderVersion) + L"\\fabric-loader-" + a2w(kFabricLoaderVersion) + L".jar") + L"\n" +
         L"bundledMods=" + FileStamp(packageDir + L"\\runtime\\bundled-mods") + L"\n" +
         L"logConfig=" + FileStamp(packageDir + L"\\runtime\\log_configs\\client-uwp.xml") + L"\n" +
@@ -298,7 +303,18 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
         GetFileAttributesW((localDir + L"\\jre\\conf\\security\\java.security").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJavaSecurityPatch =
         GetFileAttributesW((localDir + L"\\java-base-security-realpath.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
-    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaSecurityPatch;
+    const bool hasJavaZipfsPatch =
+        GetFileAttributesW((localDir + L"\\java-zipfs-realpath.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool packageHasJre21 =
+        GetFileAttributesW((packageDir + L"\\jre21\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasJre21 = !packageHasJre21 ||
+        (GetFileAttributesW((localDir + L"\\jre21\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW((localDir + L"\\jre21\\conf\\security\\java.security").c_str()) != INVALID_FILE_ATTRIBUTES);
+    const bool hasJavaSecurityPatch21 = !packageHasJre21 ||
+        GetFileAttributesW((localDir + L"\\java-base-security-realpath-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasJavaZipfsPatch21 = !packageHasJre21 ||
+        GetFileAttributesW((localDir + L"\\java-zipfs-realpath-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaSecurityPatch && hasJavaZipfsPatch && hasJre21 && hasJavaSecurityPatch21 && hasJavaZipfsPatch21;
 }
 
 static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -366,14 +382,19 @@ static bool SeedLocalRuntime(
         progress(L"Copying Java runtime", L"Preparing JVM files", 0.52f);
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\jre", localDir + L"\\jre");
+    CopyDirectoryContentsIfNeeded(packageDir + L"\\jre21", localDir + L"\\jre21");
     std::wstring xboxSecurityProperties;
     if (ReadTextFile(packageDir + L"\\xbox_security.properties", xboxSecurityProperties)) {
-        const std::wstring localSecurityDir = localDir + L"\\jre\\conf\\security";
-        if (!WriteTextFile(localSecurityDir + L"\\java.security", xboxSecurityProperties)) {
-            WriteLogF(L"Failed to rewrite LocalState java.security err=%u", GetLastError());
-        }
-        if (!WriteTextFile(localSecurityDir + L"\\xbox.properties", xboxSecurityProperties)) {
-            WriteLogF(L"Failed to write LocalState xbox.properties err=%u", GetLastError());
+        const std::wstring runtimeDirs[] = { L"jre", L"jre21" };
+        for (const std::wstring& runtimeDir : runtimeDirs) {
+            const std::wstring localSecurityDir = localDir + L"\\" + runtimeDir + L"\\conf\\security";
+            if (GetFileAttributesW(localSecurityDir.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            if (!WriteTextFile(localSecurityDir + L"\\java.security", xboxSecurityProperties)) {
+                WriteLogF(L"Failed to rewrite LocalState %s java.security err=%u", runtimeDir.c_str(), GetLastError());
+            }
+            if (!WriteTextFile(localSecurityDir + L"\\xbox.properties", xboxSecurityProperties)) {
+                WriteLogF(L"Failed to write LocalState %s xbox.properties err=%u", runtimeDir.c_str(), GetLastError());
+            }
         }
     } else {
         WriteLogF(L"Failed to read packaged xbox_security.properties err=%u", GetLastError());
@@ -388,6 +409,9 @@ static bool SeedLocalRuntime(
     }
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
     CopyFileIfNeeded(packageDir + L"\\java-base-security-realpath.jar", localDir + L"\\java-base-security-realpath.jar");
+    CopyFileIfNeeded(packageDir + L"\\java-base-security-realpath-21.jar", localDir + L"\\java-base-security-realpath-21.jar");
+    CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath.jar", localDir + L"\\java-zipfs-realpath.jar");
+    CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath-21.jar", localDir + L"\\java-zipfs-realpath-21.jar");
     if (progress) {
         progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
     }
@@ -985,7 +1009,11 @@ static bool ReadDownloadManifest(const std::wstring& path, std::vector<DownloadM
     return true;
 }
 
-static void CollectManifestLibraryJars(const std::wstring& manifestPath, const std::wstring& runtimeRoot, std::vector<std::wstring>& jars) {
+static void CollectManifestLibraryJars(
+    const std::wstring& manifestPath,
+    const std::wstring& runtimeRoot,
+    const std::wstring& packageDir,
+    std::vector<std::wstring>& jars) {
     std::vector<DownloadManifestEntry> entries;
     if (!ReadDownloadManifest(manifestPath, entries)) return;
     for (const auto& e : entries) {
@@ -995,7 +1023,12 @@ static void CollectManifestLibraryJars(const std::wstring& manifestPath, const s
         if (rel.rfind(L"game/libraries/", 0) != 0) continue;
         if (rel.size() < 4 || rel.compare(rel.size() - 4, 4, L".jar") != 0) continue;
         if (rel.find(L"-natives-") != std::wstring::npos) continue;
-        const std::wstring abs = JoinRuntimeRelativePath(runtimeRoot, e.relativePath);
+        const std::wstring libraryRelative = e.relativePath.substr(wcslen(L"game\\libraries\\"));
+        const std::wstring packagedOverride = packageDir + L"\\runtime\\libraries\\" + libraryRelative;
+        const std::wstring abs =
+            GetFileAttributesW(packagedOverride.c_str()) != INVALID_FILE_ATTRIBUTES
+                ? packagedOverride
+                : JoinRuntimeRelativePath(runtimeRoot, e.relativePath);
         if (!abs.empty()) jars.push_back(abs);
     }
 }
@@ -2762,13 +2795,14 @@ static bool PrepareTargetNativeDir(
     nativeDir = runtimeRoot + L"\\runtime\\natives\\" + SafePathSegment(targetId);
     const std::wstring packageNativesDir = packageDir + L"\\natives";
     const std::wstring markerPath = nativeDir + L"\\.native_manifest";
-    const std::wstring marker = L"nativeVersion=2\nmanifest=" + FileStamp(manifestPath) +
+    const std::wstring marker = L"nativeVersion=3\nmanifest=" + FileStamp(manifestPath) +
         L"\nglfw=" + FileStamp(packageNativesDir + L"\\glfw.dll") + L"\n";
 
     std::wstring existingMarker;
     if (ReadTextFile(markerPath, existingMarker) && existingMarker == marker &&
         GetFileAttributesW((nativeDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
         GetFileAttributesW((nativeDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((nativeDir + L"\\jemalloc.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
         GetFileAttributesW((nativeDir + L"\\jnidispatch.dll").c_str()) != INVALID_FILE_ATTRIBUTES) {
         return true;
     }
@@ -2799,6 +2833,7 @@ static bool PrepareTargetNativeDir(
         extractedJna &&
         GetFileAttributesW((nativeDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
         GetFileAttributesW((nativeDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((nativeDir + L"\\jemalloc.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
         GetFileAttributesW((nativeDir + L"\\jnidispatch.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
     if (ready) {
         WriteTextFile(markerPath, marker);
@@ -3297,6 +3332,46 @@ static std::wstring TargetProfileText(const LaunchTarget& target) {
     return text;
 }
 
+struct JavaRuntimeInfo {
+    std::wstring runtimeId;
+    std::wstring packageRelativeDir;
+    std::wstring packageDir;
+    std::wstring localDir;
+    std::wstring selectedDir;
+    std::wstring securityPatchName;
+    std::wstring zipfsPatchName;
+};
+
+static JavaRuntimeInfo ResolveJavaRuntimeInfo(
+    const std::wstring& packageDir,
+    const std::wstring& localRoot,
+    const std::wstring& requestedRuntime) {
+    std::wstring id = ToLowerW(requestedRuntime);
+    if (id.empty()) id = L"current";
+
+    JavaRuntimeInfo info;
+    info.runtimeId = id;
+    if (id == L"java21" || id == L"legacy21" || id == L"jdk21" || id == L"21") {
+        info.runtimeId = L"java21";
+        info.packageRelativeDir = L"jre21";
+        info.securityPatchName = L"java-base-security-realpath-21.jar";
+        info.zipfsPatchName = L"java-zipfs-realpath-21.jar";
+    } else {
+        info.runtimeId = L"current";
+        info.packageRelativeDir = L"jre";
+        info.securityPatchName = L"java-base-security-realpath.jar";
+        info.zipfsPatchName = L"java-zipfs-realpath.jar";
+    }
+
+    info.packageDir = packageDir + L"\\" + info.packageRelativeDir;
+    info.localDir = localRoot + L"\\" + info.packageRelativeDir;
+    info.selectedDir =
+        GetFileAttributesW((info.packageDir + L"\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES
+            ? info.packageDir
+            : info.localDir;
+    return info;
+}
+
 static LaunchTarget TargetFromProfile(const Profile& p) {
     LaunchTarget t = DefaultLaunchTarget();
     if (!p.minecraftVersion.empty()) t.minecraftVersion = p.minecraftVersion;
@@ -3389,6 +3464,7 @@ struct MinecraftVersionInfo {
     std::wstring minecraftVersion;
     std::wstring loader;
     std::wstring loaderVersion;
+    std::wstring javaRuntime;
     std::wstring assetIndex;
     std::wstring launchVersion;
     std::wstring manifestPath;
@@ -3421,6 +3497,7 @@ static MinecraftVersionInfo ResolveVersionInfo(const std::wstring& packageDir, c
     info.minecraftVersion = target.minecraftVersion;
     info.loader = target.loader;
     info.loaderVersion = target.loaderVersion;
+    info.javaRuntime = target.javaRuntime.empty() ? L"current" : target.javaRuntime;
     info.clientJar = runtimeRoot + L"\\game\\versions\\" + target.minecraftVersion + L"\\" + target.minecraftVersion + L".jar";
 
     const LaunchTarget def = DefaultLaunchTarget();
@@ -6656,15 +6733,21 @@ static bool PublishCoreWindowProperty(ICoreWindow* window) {
     return true;
 }
 
-static bool PreloadJvm(const std::wstring& exeDir, const std::wstring& jreDir, const std::wstring& nativesDir, HMODULE* jvmModule) {
+static bool PreloadJvm(
+    const std::wstring& exeDir,
+    const std::wstring& jreDir,
+    const std::wstring& packagedJreRelativeDir,
+    const std::wstring& nativesDir,
+    HMODULE* jvmModule) {
     const std::wstring jreBin = jreDir + L"\\bin";
     const std::wstring jreServer = jreBin + L"\\server";
     const std::wstring path = jreBin + L";" + jreServer + L";" + exeDir + L";" + nativesDir + L";" + GetEnvVarString(L"PATH");
     SetEnvironmentVariableW(L"PATH", path.c_str());
     SetEnvironmentVariableW(L"JAVA_HOME", jreDir.c_str());
 
-    auto loadPackaged = [&](const wchar_t* relativePath, const wchar_t* label) -> HMODULE {
-        HMODULE module = LoadPackagedLibrary(relativePath, 0);
+    const std::wstring packagedPrefix = packagedJreRelativeDir.empty() ? L"jre" : packagedJreRelativeDir;
+    auto loadPackaged = [&](const std::wstring& relativePath, const wchar_t* label) -> HMODULE {
+        HMODULE module = LoadPackagedLibrary(relativePath.c_str(), 0);
         if (!module) {
             WriteLogF(L"LoadPackagedLibrary(%s) failed err=%u", label, GetLastError());
         }
@@ -6673,19 +6756,19 @@ static bool PreloadJvm(const std::wstring& exeDir, const std::wstring& jreDir, c
 
     // Preload the JRE CRT/runtime DLLs from jre\bin so jvm.dll can resolve
     // its non-system imports while running inside the app package.
-	loadPackaged(L"jre\\bin\\vcruntime140.dll", L"vcruntime140.dll");
-    loadPackaged(L"jre\\bin\\vcruntime140_1.dll", L"vcruntime140_1.dll");
-    loadPackaged(L"jre\\bin\\msvcp140.dll", L"msvcp140.dll");
-    loadPackaged(L"jre\\bin\\jli.dll", L"jli.dll");
+	loadPackaged(packagedPrefix + L"\\bin\\vcruntime140.dll", L"vcruntime140.dll");
+    loadPackaged(packagedPrefix + L"\\bin\\vcruntime140_1.dll", L"vcruntime140_1.dll");
+    loadPackaged(packagedPrefix + L"\\bin\\msvcp140.dll", L"msvcp140.dll");
+    loadPackaged(packagedPrefix + L"\\bin\\jli.dll", L"jli.dll");
 
-    *jvmModule = loadPackaged(L"jre\\bin\\server\\jvm.dll", L"jvm.dll");
+    *jvmModule = loadPackaged(packagedPrefix + L"\\bin\\server\\jvm.dll", L"jvm.dll");
     if (!*jvmModule) {
         return false;
     }
 	
-	loadPackaged(L"jre\\bin\\java.dll", L"java.dll");
+	loadPackaged(packagedPrefix + L"\\bin\\java.dll", L"java.dll");
 
-    WriteLog(L"JVM DLLs loaded");
+    WriteLogF(L"JVM DLLs loaded from package runtime %s", packagedPrefix.c_str());
     return true;
 }
 
@@ -6918,6 +7001,9 @@ done:
 static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring& packageDir,
     const std::wstring& jreDir,
+    const std::wstring& packagedJreRelativeDir,
+    const std::wstring& javaSecurityPatchName,
+    const std::wstring& javaZipfsPatchName,
     const std::wstring& gameDir,
     const std::wstring& assetsDir,
     const std::wstring& nativesDir,
@@ -6952,7 +7038,20 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     EnsureDirectoryTree(gameDir + L"\\logs");
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
+    EnsureDirectoryTree(gameDir + L"\\saves");
+    EnsureDirectoryTree(gameDir + L"\\resourcepacks");
+    EnsureDirectoryTree(gameDir + L"\\screenshots");
+    EnsureDirectoryTree(gameDir + L"\\config");
+    DeleteDirectoryTree(gameDir + L"\\showdown");
+    DeleteDirectoryTree(exeDir + L"\\showdown");
+    EnsureDirectoryTree(gameDir + L"\\showdown");
+    EnsureDirectoryTree(exeDir + L"\\showdown");
     EnsureDirectoryTree(userModsDir);
+    if (SetCurrentDirectoryW(gameDir.c_str())) {
+        WriteLogF(L"Process current directory set to gameDir: %s", gameDir.c_str());
+    } else {
+        WriteLogF(L"Failed to set process current directory to gameDir err=%u", GetLastError());
+    }
     EnsureDirectoryTree(lwjglTmpDir);
     DeleteFileW(javaLog.c_str());
     DeleteFileW(stderrLogPath.c_str());
@@ -6988,8 +7087,10 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Xms512M");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
-    const std::wstring localJavaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";
-    const std::wstring packagedJavaSecurityPatch = packageDir + L"\\java-base-security-realpath.jar";
+    const std::wstring selectedJavaSecurityPatchName =
+        javaSecurityPatchName.empty() ? L"java-base-security-realpath.jar" : javaSecurityPatchName;
+    const std::wstring localJavaSecurityPatch = exeDir + L"\\" + selectedJavaSecurityPatchName;
+    const std::wstring packagedJavaSecurityPatch = packageDir + L"\\" + selectedJavaSecurityPatchName;
     const std::wstring javaSecurityPatch =
         GetFileAttributesW(localJavaSecurityPatch.c_str()) != INVALID_FILE_ATTRIBUTES
             ? localJavaSecurityPatch
@@ -6999,6 +7100,20 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         WriteLogF(L"Java security realpath patch enabled: %s", javaSecurityPatch.c_str());
     } else {
         WriteLogF(L"Java security realpath patch missing: %s", javaSecurityPatch.c_str());
+    }
+    const std::wstring selectedJavaZipfsPatchName =
+        javaZipfsPatchName.empty() ? L"java-zipfs-realpath.jar" : javaZipfsPatchName;
+    const std::wstring localJavaZipfsPatch = exeDir + L"\\" + selectedJavaZipfsPatchName;
+    const std::wstring packagedJavaZipfsPatch = packageDir + L"\\" + selectedJavaZipfsPatchName;
+    const std::wstring javaZipfsPatch =
+        GetFileAttributesW(localJavaZipfsPatch.c_str()) != INVALID_FILE_ATTRIBUTES
+            ? localJavaZipfsPatch
+            : packagedJavaZipfsPatch;
+    if (GetFileAttributesW(javaZipfsPatch.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        vmOptionStorage.push_back("--patch-module=jdk.zipfs=" + w2a(fwd(javaZipfsPatch)));
+        WriteLogF(L"Java ZipFS realpath patch enabled: %s", javaZipfsPatch.c_str());
+    } else {
+        WriteLogF(L"Java ZipFS realpath patch missing: %s", javaZipfsPatch.c_str());
     }
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
@@ -7072,7 +7187,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     WriteLog(L"Embedded JVM options written");
 
     HMODULE jvmModule = nullptr;
-    if (!PreloadJvm(exeDir, jreDir, nativesDir, &jvmModule)) {
+    if (!PreloadJvm(exeDir, jreDir, packagedJreRelativeDir, nativesDir, &jvmModule)) {
         return false;
     }
 
@@ -7454,12 +7569,8 @@ public:
             SleepWithAuthUi(downloadRenderer, downloadState, 250);
         }
 
-        const std::wstring localJreDir = exeDir + L"\\jre";
-        const std::wstring packageJreDir = packageDir + L"\\jre";
-        const std::wstring jreDir =
-            GetFileAttributesW((packageJreDir + L"\\bin\\java.exe").c_str()) != INVALID_FILE_ATTRIBUTES
-                ? packageJreDir
-                : localJreDir;
+        const JavaRuntimeInfo javaRuntime = ResolveJavaRuntimeInfo(packageDir, exeDir, versionInfo.javaRuntime);
+        const std::wstring jreDir = javaRuntime.selectedDir;
         const std::wstring gameDir = exeDir + L"\\game";
         const std::wstring javaExe = jreDir + L"\\bin\\java.exe";
         const std::wstring assetsDir = exeDir + L"\\assets";
@@ -7468,19 +7579,17 @@ public:
         const std::wstring effManifestPath = versionInfo.manifestPath.empty()
             ? (packageDir + L"\\download_manifest.tsv")
             : versionInfo.manifestPath;
-        std::wstring nativesDir =
-            GetFileAttributesW((packageNativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
-            GetFileAttributesW((packageNativesDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES
-                ? packageNativesDir
-                : localNativesDir;
-        const LaunchTarget defaultTarget = DefaultLaunchTarget();
-        if (versionInfo.targetId != defaultTarget.targetId) {
-            std::wstring targetNativesDir;
-            if (PrepareTargetNativeDir(effManifestPath, exeDir, packageDir, versionInfo.targetId, targetNativesDir)) {
-                nativesDir = targetNativesDir;
-            } else {
-                WriteLogF(L"Falling back to default natives for target=%s", versionInfo.targetId.c_str());
-            }
+        std::wstring targetNativesDir;
+        std::wstring nativesDir;
+        if (PrepareTargetNativeDir(effManifestPath, exeDir, packageDir, versionInfo.targetId, targetNativesDir)) {
+            nativesDir = targetNativesDir;
+        } else {
+            nativesDir =
+                GetFileAttributesW((packageNativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesW((packageNativesDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES
+                    ? packageNativesDir
+                    : localNativesDir;
+            WriteLogF(L"Falling back to default natives for target=%s", versionInfo.targetId.c_str());
         }
         const std::wstring minecraftVersion = versionInfo.minecraftVersion;
         const std::wstring packageRuntimeDir = packageDir + L"\\runtime";
@@ -7494,10 +7603,16 @@ public:
         const std::wstring javaLog = exeDir + L"\\java_output.log";
 
         WriteLogF(L"exeDir: %s", exeDir.c_str());
+        WriteLogF(L"target java runtime: requested=%s resolved=%s packageRelative=%s securityPatch=%s zipfsPatch=%s",
+            versionInfo.javaRuntime.c_str(),
+            javaRuntime.runtimeId.c_str(),
+            javaRuntime.packageRelativeDir.c_str(),
+            javaRuntime.securityPatchName.c_str(),
+            javaRuntime.zipfsPatchName.c_str());
         WriteLogF(L"jreDir: %s", jreDir.c_str());
         WriteLogF(L"jre release stamp: %s", FileStamp(jreDir + L"\\release").c_str());
-        WriteLogF(L"local jre release stamp: %s", FileStamp(localJreDir + L"\\release").c_str());
-        WriteLogF(L"package jre release stamp: %s", FileStamp(packageJreDir + L"\\release").c_str());
+        WriteLogF(L"local target jre release stamp: %s", FileStamp(javaRuntime.localDir + L"\\release").c_str());
+        WriteLogF(L"package target jre release stamp: %s", FileStamp(javaRuntime.packageDir + L"\\release").c_str());
         WriteLogF(L"nativesDir: %s", nativesDir.c_str());
         WriteLogF(L"packagedLibrariesDir: %s", packagedLibrariesDir.c_str());
         WriteLogF(L"downloadedLibrariesDir: %s", (gameDir + L"\\libraries").c_str());
@@ -7517,7 +7632,7 @@ public:
         } else {
             CollectJars(packagedLibrariesDir, jars);
         }
-        CollectManifestLibraryJars(effManifestPath, exeDir, jars);
+        CollectManifestLibraryJars(effManifestPath, exeDir, packageDir, jars);
         jars.push_back(clientJar);
         WriteLogF(L"JAR count: %zu", jars.size());
 
@@ -7530,7 +7645,25 @@ public:
         g_minecraftRunning.store(true);
         const std::wstring effLaunchVersion = versionInfo.launchVersion.empty() ? a2w(kFabricLaunchVersion) : versionInfo.launchVersion;
         const std::wstring effAssetIndex = versionInfo.assetIndex.empty() ? a2w(kMinecraftAssetIndex) : versionInfo.assetIndex;
-        if (!RunEmbeddedMinecraft(exeDir, packageDir, jreDir, gameDir, assetsDir, nativesDir, bundledModsDir, userModsDir, clientJar, javaLog, argsPath, cp, effLaunchVersion, effAssetIndex, authConfig)) {
+        if (!RunEmbeddedMinecraft(
+                exeDir,
+                packageDir,
+                jreDir,
+            javaRuntime.packageRelativeDir,
+            javaRuntime.securityPatchName,
+            javaRuntime.zipfsPatchName,
+            gameDir,
+                assetsDir,
+                nativesDir,
+                bundledModsDir,
+                userModsDir,
+                clientJar,
+                javaLog,
+                argsPath,
+                cp,
+                effLaunchVersion,
+                effAssetIndex,
+                authConfig)) {
             g_minecraftRunning.store(false);
             WriteLog(L"Embedded JVM launch failed");
             return E_FAIL;
