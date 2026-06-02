@@ -44,7 +44,7 @@ $disabledMixins = @()
 $disabledSources = @()
 $controllerCompatVersions = @("1.16.5", "1.19.2")
 if ($controllerCompatVersions -notcontains $MinecraftVersion) {
-    $disabledMixins += @("BanditControllerClientMixin", "BanditControllerScreenMixin")
+    $disabledMixins += @("BanditControllerClientMixin", "BanditControllerGameRendererMixin", "BanditControllerHandledScreenMixin", "BanditControllerRecipeBookScreenMixin", "BanditControllerScreenMixin")
     $disabledSources += "BanditControllerCompat"
 }
 

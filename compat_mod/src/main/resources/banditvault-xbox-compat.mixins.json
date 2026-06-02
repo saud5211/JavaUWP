@@ -5,6 +5,9 @@
   "compatibilityLevel": "JAVA_21",
   "client": [
     "BanditControllerClientMixin",
+    "BanditControllerGameRendererMixin",
+    "BanditControllerHandledScreenMixin",
+    "BanditControllerRecipeBookScreenMixin",
     "BanditControllerScreenMixin",
     "CobblemonShowdownFileSystemMixin",
     "MinecraftClientProbeMixin",

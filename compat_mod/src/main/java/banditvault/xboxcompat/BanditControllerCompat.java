@@ -1,9 +1,13 @@
 package banditvault.xboxcompat;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.class_304;
 import net.minecraft.class_310;
 import net.minecraft.class_315;
 import net.minecraft.class_332;
+import net.minecraft.class_465;
+import net.minecraft.class_1713;
+import net.minecraft.class_1735;
 import net.minecraft.class_437;
 import net.minecraft.class_4587;
 import net.minecraft.class_746;
@@ -14,18 +18,22 @@ public final class BanditControllerCompat {
     private static final int GAMEPAD_ID = GLFW.GLFW_JOYSTICK_1;
     private static final float MOVE_THRESHOLD = 0.35f;
     private static final float LOOK_DEADZONE = 0.12f;
-    private static final float LOOK_SPEED = 5.5f;
+    private static final float LOOK_SPEED_PER_SECOND = 135.0f;
     private static final double CURSOR_SPEED = 14.0;
     private static final int LEFT_CLICK = 0;
     private static final int RIGHT_CLICK = 1;
 
     private static final GLFWGamepadState STATE = GLFWGamepadState.create();
     private static final boolean[] LAST_BUTTONS = new boolean[15];
+    private static final boolean[] LAST_TRIGGER_HELD = new boolean[2];
     private static boolean loggedReady;
     private static boolean loggedLookReflectionFailure;
+    private static boolean loggedHotbarReflectionFailure;
+    private static boolean loggedQuickMoveReflectionFailure;
     private static boolean active;
     private static double cursorX = -1.0;
     private static double cursorY = -1.0;
+    private static long lastLookNanos;
     private static int scrollCooldown;
 
     private BanditControllerCompat() {
@@ -51,6 +59,7 @@ public final class BanditControllerCompat {
         }
 
         if (client.field_1755 != null) {
+            lastLookNanos = 0L;
             releaseGameplayKeys(client);
             tickScreen(client, client.field_1755);
         } else {
@@ -60,6 +69,27 @@ public final class BanditControllerCompat {
         copyButtons();
     }
 
+    public static void renderFrame(class_310 client) {
+        if (client == null || client.field_1755 != null || client.field_1724 == null || !poll()) {
+            lastLookNanos = 0L;
+            return;
+        }
+
+        long now = System.nanoTime();
+        float seconds = 1.0f / 60.0f;
+        if (lastLookNanos != 0L) {
+            seconds = (now - lastLookNanos) / 1000000000.0f;
+            if (seconds < 1.0f / 240.0f) {
+                seconds = 1.0f / 240.0f;
+            } else if (seconds > 1.0f / 20.0f) {
+                seconds = 1.0f / 20.0f;
+            }
+        }
+        lastLookNanos = now;
+
+        applyLook(client.field_1724, axis(GLFW.GLFW_GAMEPAD_AXIS_RIGHT_X), axis(GLFW.GLFW_GAMEPAD_AXIS_RIGHT_Y), seconds);
+    }
+
     public static void renderCursor(class_437 screen, class_4587 matrices) {
         if (!active || screen == null || cursorX < 0.0 || cursorY < 0.0) {
             return;
@@ -67,9 +97,29 @@ public final class BanditControllerCompat {
 
         int x = (int)Math.round(cursorX);
         int y = (int)Math.round(cursorY);
+        RenderSystem.disableDepthTest();
+        RenderSystem.enableBlend();
+        matrices.method_22903();
+        matrices.method_22904(0.0, 0.0, 400.0);
+        class_332.method_25294(matrices, x - 3, y - 3, x + 4, y + 4, 0x66000000);
         class_332.method_25294(matrices, x - 5, y, x + 6, y + 1, 0xFFFFFFFF);
         class_332.method_25294(matrices, x, y - 5, x + 1, y + 6, 0xFFFFFFFF);
-        class_332.method_25294(matrices, x - 3, y - 3, x + 4, y + 4, 0x66000000);
+        matrices.method_22909();
+        RenderSystem.enableDepthTest();
+    }
+
+    public static int screenMouseX(int fallback) {
+        if (!active || cursorX < 0.0) {
+            return fallback;
+        }
+        return (int)Math.round(cursorX);
+    }
+
+    public static int screenMouseY(int fallback) {
+        if (!active || cursorY < 0.0) {
+            return fallback;
+        }
+        return (int)Math.round(cursorY);
     }
 
     private static boolean poll() {
@@ -98,18 +148,28 @@ public final class BanditControllerCompat {
         setHeld(options.field_1849, lx > MOVE_THRESHOLD);
         setHeld(options.field_1903, button(GLFW.GLFW_GAMEPAD_BUTTON_A));
         setHeld(options.field_1832, button(GLFW.GLFW_GAMEPAD_BUTTON_B));
-        setHeld(options.field_1867, button(GLFW.GLFW_GAMEPAD_BUTTON_LEFT_BUMPER));
         setHeld(options.field_1886, trigger(GLFW.GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER));
         setHeld(options.field_1904, trigger(GLFW.GLFW_GAMEPAD_AXIS_LEFT_TRIGGER));
-        setEdge(options.field_1822, pressed(GLFW.GLFW_GAMEPAD_BUTTON_Y));
+        setHeld(options.field_1867, button(GLFW.GLFW_GAMEPAD_BUTTON_LEFT_THUMB));
 
-        if (pressed(GLFW.GLFW_GAMEPAD_BUTTON_START)) {
-            client.method_1490();
+        if (triggerPressed(GLFW.GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER)) {
+            pressKey(options.field_1886);
+        }
+        if (triggerPressed(GLFW.GLFW_GAMEPAD_AXIS_LEFT_TRIGGER)) {
+            pressKey(options.field_1904);
+        }
+        if (pressed(GLFW.GLFW_GAMEPAD_BUTTON_Y)) {
+            pressKey(options.field_1822);
+        }
+        if (pressed(GLFW.GLFW_GAMEPAD_BUTTON_LEFT_BUMPER)) {
+            changeHotbarSlot(client.field_1724, -1);
+        }
+        if (pressed(GLFW.GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER)) {
+            changeHotbarSlot(client.field_1724, 1);
         }
 
-        class_746 player = client.field_1724;
-        if (player != null) {
-            applyLook(player, rx, ry);
+        if (pressed(GLFW.GLFW_GAMEPAD_BUTTON_START)) {
+            client.method_20539(false);
         }
     }
 
@@ -121,10 +181,9 @@ public final class BanditControllerCompat {
 
         float lx = axis(GLFW.GLFW_GAMEPAD_AXIS_LEFT_X);
         float ly = axis(GLFW.GLFW_GAMEPAD_AXIS_LEFT_Y);
-        float rx = axis(GLFW.GLFW_GAMEPAD_AXIS_RIGHT_X);
         float ry = axis(GLFW.GLFW_GAMEPAD_AXIS_RIGHT_Y);
-        double dx = shapedCursorAxis(Math.abs(lx) > Math.abs(rx) ? lx : rx);
-        double dy = shapedCursorAxis(Math.abs(ly) > Math.abs(ry) ? ly : ry);
+        double dx = shapedCursorAxis(lx);
+        double dy = shapedCursorAxis(ly);
 
         cursorX = clamp(cursorX + dx * CURSOR_SPEED, 0.0, Math.max(1, screen.field_22789 - 1));
         cursorY = clamp(cursorY + dy * CURSOR_SPEED, 0.0, Math.max(1, screen.field_22790 - 1));
@@ -147,15 +206,18 @@ public final class BanditControllerCompat {
                 client.method_1507(null);
             }
         }
+        if (pressed(GLFW.GLFW_GAMEPAD_BUTTON_Y)) {
+            quickMoveFocusedSlot(screen);
+        }
 
         if (scrollCooldown > 0) {
             scrollCooldown--;
         }
         if (scrollCooldown == 0) {
             double scroll = 0.0;
-            if (button(GLFW.GLFW_GAMEPAD_BUTTON_DPAD_UP)) {
+            if (ry < -0.35f || button(GLFW.GLFW_GAMEPAD_BUTTON_DPAD_UP)) {
                 scroll = 1.0;
-            } else if (button(GLFW.GLFW_GAMEPAD_BUTTON_DPAD_DOWN)) {
+            } else if (ry > 0.35f || button(GLFW.GLFW_GAMEPAD_BUTTON_DPAD_DOWN)) {
                 scroll = -1.0;
             }
             if (scroll != 0.0) {
@@ -165,7 +227,7 @@ public final class BanditControllerCompat {
         }
     }
 
-    private static void applyLook(class_746 player, float rx, float ry) {
+    private static void applyLook(class_746 player, float rx, float ry, float seconds) {
         float lookX = shapedLookAxis(rx);
         float lookY = shapedLookAxis(ry);
         if (lookX == 0.0f && lookY == 0.0f) {
@@ -175,8 +237,9 @@ public final class BanditControllerCompat {
         try {
             float yaw = getEntityFloat(player, "field_6031");
             float pitch = getEntityFloat(player, "field_5965");
-            setEntityFloat(player, "field_6031", yaw + lookX * LOOK_SPEED);
-            setEntityFloat(player, "field_5965", (float)clamp(pitch + lookY * LOOK_SPEED, -90.0, 90.0));
+            float scale = LOOK_SPEED_PER_SECOND * seconds;
+            setEntityFloat(player, "field_6031", yaw + lookX * scale);
+            setEntityFloat(player, "field_5965", (float)clamp(pitch + lookY * scale, -90.0, 90.0));
         } catch (Throwable t) {
             if (!loggedLookReflectionFailure) {
                 loggedLookReflectionFailure = true;
@@ -206,11 +269,75 @@ public final class BanditControllerCompat {
         class_304.method_1416(key.method_1429(), held);
     }
 
-    private static void setEdge(class_304 key, boolean pressed) {
-        if (pressed) {
-            setHeld(key, true);
-        } else if (released(GLFW.GLFW_GAMEPAD_BUTTON_Y)) {
-            setHeld(key, false);
+    private static void pressKey(class_304 key) {
+        if (key == null) {
+            return;
+        }
+        class_304.method_1420(key.method_1429());
+    }
+
+    private static void changeHotbarSlot(class_746 player, int direction) {
+        if (player == null) {
+            return;
+        }
+
+        try {
+            Object inventory = getInventory(player);
+            java.lang.reflect.Field selectedSlot = findField(inventory.getClass(), "field_7545");
+            selectedSlot.setAccessible(true);
+            int slot = selectedSlot.getInt(inventory);
+            slot = (slot + direction) % 9;
+            if (slot < 0) {
+                slot += 9;
+            }
+            selectedSlot.setInt(inventory, slot);
+        } catch (Throwable t) {
+            if (!loggedHotbarReflectionFailure) {
+                loggedHotbarReflectionFailure = true;
+                XboxCompatLog.logException("Bandit controller compat failed to change hotbar slot", t);
+            }
+        }
+    }
+
+    private static void quickMoveFocusedSlot(class_437 screen) {
+        if (!(screen instanceof class_465)) {
+            return;
+        }
+
+        try {
+            java.lang.reflect.Field focusedSlotField = findField(screen.getClass(), "field_2787");
+            focusedSlotField.setAccessible(true);
+            class_1735 slot = (class_1735)focusedSlotField.get(screen);
+            if (slot == null || !slot.method_7681()) {
+                return;
+            }
+
+            java.lang.reflect.Method clickSlot = findMethod(
+                screen.getClass(),
+                "method_2383",
+                class_1735.class,
+                int.class,
+                int.class,
+                class_1713.class);
+            clickSlot.setAccessible(true);
+            clickSlot.invoke(screen, slot, slot.field_7874, 0, class_1713.field_7794);
+        } catch (Throwable t) {
+            if (!loggedQuickMoveReflectionFailure) {
+                loggedQuickMoveReflectionFailure = true;
+                XboxCompatLog.logException("Bandit controller compat failed to quick-move focused slot", t);
+            }
+        }
+    }
+
+    private static Object getInventory(class_746 player) throws ReflectiveOperationException {
+        try {
+            java.lang.reflect.Field field = findField(player.getClass(), "field_7514");
+            field.setAccessible(true);
+            return field.get(player);
+        } catch (NoSuchFieldException ignored) {
+            java.lang.reflect.Method method = findMethod(player.getClass(), "method_31548");
+            method.setAccessible(true);
+            return method.invoke(player);
         }
     }
 
@@ -220,6 +347,10 @@ public final class BanditControllerCompat {
 
     private static boolean trigger(int index) {
         return axis(index) > 0.25f;
+    }
+
+    private static boolean triggerPressed(int index) {
+        return trigger(index) && !LAST_TRIGGER_HELD[index - GLFW.GLFW_GAMEPAD_AXIS_LEFT_TRIGGER];
     }
 
     private static boolean button(int index) {
@@ -238,6 +369,8 @@ public final class BanditControllerCompat {
         for (int i = 0; i < LAST_BUTTONS.length; i++) {
             LAST_BUTTONS[i] = button(i);
         }
+        LAST_TRIGGER_HELD[0] = trigger(GLFW.GLFW_GAMEPAD_AXIS_LEFT_TRIGGER);
+        LAST_TRIGGER_HELD[1] = trigger(GLFW.GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER);
     }
 
     private static float shapedLookAxis(float value) {
@@ -292,6 +425,30 @@ public final class BanditControllerCompat {
             }
         }
         throw new NoSuchFieldException(fieldName);
+    }
+
+    private static java.lang.reflect.Method findMethod(Class<?> type, String methodName) throws NoSuchMethodException {
+        Class<?> current = type;
+        while (current != null) {
+            try {
+                return current.getDeclaredMethod(methodName);
+            } catch (NoSuchMethodException ignored) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchMethodException(methodName);
+    }
+
+    private static java.lang.reflect.Method findMethod(Class<?> type, String methodName, Class<?>... parameterTypes) throws NoSuchMethodException {
+        Class<?> current = type;
+        while (current != null) {
+            try {
+                return current.getDeclaredMethod(methodName, parameterTypes);
+            } catch (NoSuchMethodException ignored) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchMethodException(methodName);
     }
 
     private static double clamp(double value, double min, double max) {
