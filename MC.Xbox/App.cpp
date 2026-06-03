@@ -1,3 +1,8 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <wchar.h>
 #include <stdio.h>
@@ -4676,6 +4681,560 @@ static std::wstring ProfileDisplayName(const std::wstring& runtimeRoot, const st
 static std::wstring ProfileDisplayTarget(const std::wstring& runtimeRoot, const std::wstring& id) {
     return TargetProfileText(ResolveProfileTarget(runtimeRoot, GetProfileById(runtimeRoot, id)));
 }
+
+static std::string HtmlEscape(const std::wstring& value) {
+    std::string out;
+    for (wchar_t ch : value) {
+        switch (ch) {
+        case L'&': out += "&amp;"; break;
+        case L'<': out += "&lt;"; break;
+        case L'>': out += "&gt;"; break;
+        case L'"': out += "&quot;"; break;
+        default: out += w2a(std::wstring(1, ch)); break;
+        }
+    }
+    return out;
+}
+
+static std::string UrlDecode(const std::string& value) {
+    std::string out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size()) {
+            const char hex[3] = { value[i + 1], value[i + 2], 0 };
+            char* end = nullptr;
+            const long v = strtol(hex, &end, 16);
+            if (end && *end == 0) {
+                out.push_back(static_cast<char>(v));
+                i += 2;
+                continue;
+            }
+        } else if (value[i] == '+') {
+            out.push_back(' ');
+            continue;
+        }
+        out.push_back(value[i]);
+    }
+    return out;
+}
+
+static std::string QueryValue(const std::string& query, const std::string& key) {
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        const size_t amp = query.find('&', pos);
+        const std::string part = query.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        const size_t eq = part.find('=');
+        const std::string k = UrlDecode(eq == std::string::npos ? part : part.substr(0, eq));
+        if (k == key) return UrlDecode(eq == std::string::npos ? std::string() : part.substr(eq + 1));
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return {};
+}
+
+static bool SendAll(SOCKET s, const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        const int chunk = send(s, data + sent, static_cast<int>((std::min)(len - sent, static_cast<size_t>(64 * 1024))), 0);
+        if (chunk <= 0) return false;
+        sent += static_cast<size_t>(chunk);
+    }
+    return true;
+}
+
+static void SendHttpResponse(SOCKET s, int status, const char* statusText, const std::string& contentType, const std::string& body) {
+    std::ostringstream head;
+    head << "HTTP/1.1 " << status << " " << statusText << "\r\n"
+        << "Content-Type: " << contentType << "\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Cache-Control: no-store\r\n"
+        << "Connection: close\r\n\r\n";
+    const std::string h = head.str();
+    SendAll(s, h.data(), h.size());
+    SendAll(s, body.data(), body.size());
+}
+
+static void SendHttpFile(SOCKET s, const std::wstring& path, const std::string& downloadName, const std::string& contentType) {
+    std::vector<unsigned char> data;
+    if (!ReadBinaryFileLimited(path, data)) {
+        SendHttpResponse(s, 404, "Not Found", "text/plain; charset=utf-8", "File not found.");
+        return;
+    }
+    std::ostringstream head;
+    head << "HTTP/1.1 200 OK\r\n"
+        << "Content-Type: " << contentType << "\r\n"
+        << "Content-Length: " << data.size() << "\r\n"
+        << "Content-Disposition: attachment; filename=\"" << downloadName << "\"\r\n"
+        << "Cache-Control: no-store\r\n"
+        << "Connection: close\r\n\r\n";
+    const std::string h = head.str();
+    SendAll(s, h.data(), h.size());
+    if (!data.empty()) SendAll(s, reinterpret_cast<const char*>(data.data()), data.size());
+}
+
+static std::string GuessDownloadContentType(const std::wstring& name) {
+    std::wstring lower = ToLowerW(name);
+    if (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".zip") return "application/zip";
+    if (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".jar") return "application/java-archive";
+    if (lower.size() >= 5 && lower.substr(lower.size() - 5) == L".json") return "application/json";
+    if (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".log") return "text/plain; charset=utf-8";
+    if (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".txt") return "text/plain; charset=utf-8";
+    return "application/octet-stream";
+}
+
+static std::string GenerateRemotePin() {
+    unsigned value = 0;
+    if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&value), sizeof(value), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        value = static_cast<unsigned>(GetTickCount64());
+    }
+    value = 100000 + (value % 900000);
+    char pin[16] = {};
+    sprintf_s(pin, "%06u", value);
+    return pin;
+}
+
+class RemoteFileServer {
+public:
+    void Start(const std::wstring& runtimeRoot) {
+        if (running_.load()) return;
+        if (thread_.joinable()) thread_.join();
+        runtimeRoot_ = runtimeRoot;
+        pin_ = GenerateRemotePin();
+        stop_.store(false);
+        running_.store(true);
+        thread_ = std::thread([this]() { ThreadMain(); });
+    }
+
+    void Stop() {
+        if (!running_.load()) {
+            if (thread_.joinable()) thread_.join();
+            return;
+        }
+        stop_.store(true);
+        SOCKET clientSocket = clientSocket_.exchange(INVALID_SOCKET);
+        if (clientSocket != INVALID_SOCKET) {
+            shutdown(clientSocket, SD_BOTH);
+        }
+        WakeListener();
+        if (thread_.joinable()) thread_.join();
+        running_.store(false);
+    }
+
+    bool Running() const { return running_.load(); }
+    std::string Pin() const { return pin_; }
+    int Port() const { return port_; }
+
+    std::wstring Url() const {
+        return L"http://" + a2w(LocalAddress().c_str()) + L":" + std::to_wstring(port_) + L"/?pin=" + a2w(pin_.c_str());
+    }
+
+private:
+    static constexpr int kPort = 27632;
+    std::atomic<bool> running_{ false };
+    std::atomic<bool> stop_{ false };
+    std::atomic<SOCKET> listenSocket_{ INVALID_SOCKET };
+    std::atomic<SOCKET> clientSocket_{ INVALID_SOCKET };
+    std::thread thread_;
+    std::wstring runtimeRoot_;
+    std::string pin_;
+    int port_ = kPort;
+
+    std::string LocalAddress() const {
+        char host[256] = {};
+        if (gethostname(host, sizeof(host)) != 0) return "127.0.0.1";
+        addrinfo hints = {};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* result = nullptr;
+        if (getaddrinfo(host, nullptr, &hints, &result) != 0 || !result) return "127.0.0.1";
+        std::string fallback = "127.0.0.1";
+        for (addrinfo* p = result; p; p = p->ai_next) {
+            sockaddr_in* sin = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+            char ip[INET_ADDRSTRLEN] = {};
+            if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) {
+                std::string s = ip;
+                if (s.rfind("127.", 0) != 0 && s.rfind("169.254.", 0) != 0) {
+                    freeaddrinfo(result);
+                    return s;
+                }
+                fallback = s;
+            }
+        }
+        freeaddrinfo(result);
+        return fallback;
+    }
+
+    void WakeListener() {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return;
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        addr.sin_port = htons(kPort);
+        connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        closesocket(s);
+    }
+
+    void ThreadMain() {
+        WSADATA wsa = {};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            WriteLog(L"Remote file server WSAStartup failed");
+            running_.store(false);
+            return;
+        }
+
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) {
+            WriteLogF(L"Remote file server socket failed err=%d", WSAGetLastError());
+            WSACleanup();
+            running_.store(false);
+            return;
+        }
+
+        BOOL reuse = TRUE;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons(kPort);
+        if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(s, 8) != 0) {
+            WriteLogF(L"Remote file server bind/listen failed port=%d err=%d", kPort, WSAGetLastError());
+            closesocket(s);
+            WSACleanup();
+            running_.store(false);
+            return;
+        }
+
+        listenSocket_.store(s);
+        WriteLogF(L"Remote file server started url=%s pin=%s", Url().c_str(), a2w(pin_.c_str()).c_str());
+
+        while (!stop_.load()) {
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(s, &readSet);
+            timeval tv = {};
+            tv.tv_sec = 0;
+            tv.tv_usec = 250000;
+            const int ready = select(0, &readSet, nullptr, nullptr, &tv);
+            if (ready <= 0) continue;
+            SOCKET client = accept(s, nullptr, nullptr);
+            if (client == INVALID_SOCKET) continue;
+            if (stop_.load()) {
+                closesocket(client);
+                break;
+            }
+            clientSocket_.store(client);
+            HandleClient(client);
+            clientSocket_.compare_exchange_strong(client, INVALID_SOCKET);
+            closesocket(client);
+        }
+
+        SOCKET old = listenSocket_.exchange(INVALID_SOCKET);
+        if (old != INVALID_SOCKET) closesocket(old);
+        WSACleanup();
+        WriteLog(L"Remote file server stopped");
+    }
+
+    bool ReadRequest(SOCKET s, std::string& request, std::string& body, std::map<std::string, std::string>& headers) {
+        std::string data;
+        char buffer[8192];
+        size_t headerEnd = std::string::npos;
+        while (data.size() < 1024 * 1024) {
+            const int read = recv(s, buffer, sizeof(buffer), 0);
+            if (read <= 0) return false;
+            data.append(buffer, read);
+            headerEnd = data.find("\r\n\r\n");
+            if (headerEnd != std::string::npos) break;
+        }
+        if (headerEnd == std::string::npos) return false;
+
+        request = data.substr(0, headerEnd);
+        size_t lineStart = request.find("\r\n");
+        size_t pos = lineStart == std::string::npos ? request.size() : lineStart + 2;
+        while (pos < request.size()) {
+            const size_t next = request.find("\r\n", pos);
+            const std::string line = request.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+            const size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string key = line.substr(0, colon);
+                std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
+                size_t valueStart = colon + 1;
+                while (valueStart < line.size() && line[valueStart] == ' ') ++valueStart;
+                headers[key] = line.substr(valueStart);
+            }
+            if (next == std::string::npos) break;
+            pos = next + 2;
+        }
+
+        unsigned long long contentLength = 0;
+        auto it = headers.find("content-length");
+        if (it != headers.end()) {
+            contentLength = strtoull(it->second.c_str(), nullptr, 10);
+        }
+        if (contentLength > 128ull * 1024ull * 1024ull) return false;
+
+        body = data.substr(headerEnd + 4);
+        while (body.size() < contentLength) {
+            const int read = recv(s, buffer, sizeof(buffer), 0);
+            if (read <= 0) return false;
+            body.append(buffer, read);
+        }
+        if (body.size() > contentLength) body.resize(static_cast<size_t>(contentLength));
+        return true;
+    }
+
+    bool Authorized(const std::string& query, const std::string& body) const {
+        if (QueryValue(query, "pin") == pin_) return true;
+        return body.find("name=\"pin\"\r\n\r\n" + pin_) != std::string::npos;
+    }
+
+    std::string Layout(const std::string& title, const std::string& body) {
+        std::ostringstream html;
+        html << "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            << "<title>" << title << "</title><style>"
+            << "body{font:16px system-ui,Segoe UI,sans-serif;background:#0b1118;color:#edf3f7;margin:0;padding:28px;}"
+            << "main{max-width:820px;margin:auto;}a{color:#78d99b}.card{background:#111922;border:1px solid #263545;border-radius:8px;padding:18px;margin:14px 0;}"
+            << "input,button{font:inherit;padding:10px;border-radius:6px;border:1px solid #314253;background:#172231;color:#fff}button{background:#6bc184;color:#07110b;border:0;cursor:pointer}"
+            << "li{margin:8px 0}.muted{color:#a9b8c6}</style></head><body><main>"
+            << body << "</main></body></html>";
+        return html.str();
+    }
+
+    void HandleClient(SOCKET s) {
+        std::string request;
+        std::string body;
+        std::map<std::string, std::string> headers;
+        if (!ReadRequest(s, request, body, headers)) {
+            SendHttpResponse(s, 400, "Bad Request", "text/plain; charset=utf-8", "Bad request.");
+            return;
+        }
+
+        const size_t firstLineEnd = request.find("\r\n");
+        const std::string firstLine = request.substr(0, firstLineEnd);
+        std::istringstream first(firstLine);
+        std::string method, target, version;
+        first >> method >> target >> version;
+        const size_t q = target.find('?');
+        const std::string path = q == std::string::npos ? target : target.substr(0, q);
+        const std::string query = q == std::string::npos ? std::string() : target.substr(q + 1);
+
+        if (!Authorized(query, body)) {
+            std::string form = "<h1>Bandit Launcher files</h1><div class=\"card\"><form method=\"get\">"
+                "<label>PIN <input name=\"pin\" inputmode=\"numeric\" autofocus></label> "
+                "<button>Open</button></form></div>";
+            SendHttpResponse(s, 401, "Unauthorized", "text/html; charset=utf-8", Layout("Bandit Launcher", form));
+            return;
+        }
+
+        if (method == "GET" && path == "/") {
+            SendHttpResponse(s, 200, "OK", "text/html; charset=utf-8", Layout("Bandit Launcher", HomeHtml()));
+        } else if (method == "GET" && path == "/download") {
+            ServeDownload(s, query);
+        } else if (method == "POST" && path == "/upload-mod") {
+            HandleUpload(s, headers, body, true);
+        } else if (method == "POST" && path == "/upload-resourcepack") {
+            HandleUpload(s, headers, body, false);
+        } else {
+            SendHttpResponse(s, 404, "Not Found", "text/plain; charset=utf-8", "Not found.");
+        }
+    }
+
+    std::string LinkFor(const std::wstring& label, const std::string& key) {
+        return "<li><a href=\"/download?pin=" + pin_ + "&file=" + key + "\">" + HtmlEscape(label) + "</a></li>";
+    }
+
+    std::string HomeHtml() {
+        EnsureProfilesInitialized(runtimeRoot_);
+        const std::wstring activeId = GetActiveProfileId(runtimeRoot_);
+        const Profile active = GetProfileById(runtimeRoot_, activeId);
+        std::ostringstream out;
+        out << "<h1>Bandit Launcher files</h1>"
+            << "<p class=\"muted\">Active profile: " << HtmlEscape(active.name) << "</p>"
+            << "<div class=\"card\"><h2>Upload mod</h2>"
+            << "<form method=\"post\" action=\"/upload-mod\" enctype=\"multipart/form-data\">"
+            << "<input type=\"hidden\" name=\"pin\" value=\"" << pin_ << "\">"
+            << "<input type=\"file\" name=\"file\" accept=\".jar\"> <button>Upload to active profile</button>"
+            << "</form><p class=\"muted\">Saved to profiles/" << HtmlEscape(activeId) << "/mods.</p></div>"
+            << "<div class=\"card\"><h2>Upload resource pack</h2>"
+            << "<form method=\"post\" action=\"/upload-resourcepack\" enctype=\"multipart/form-data\">"
+            << "<input type=\"hidden\" name=\"pin\" value=\"" << pin_ << "\">"
+            << "<input type=\"file\" name=\"file\" accept=\".zip\"> <button>Upload resource pack</button>"
+            << "</form></div>"
+            << "<div class=\"card\"><h2>Logs</h2><ul>"
+            << LinkFor(L"mc_launch.log", "log:mc_launch.log")
+            << LinkFor(L"java_output.log", "log:java_output.log")
+            << LinkFor(L"stderr_stream.log", "log:stderr_stream.log")
+            << LinkFor(L"glfw_uwp.log", "log:glfw_uwp.log")
+            << LinkFor(L"xboxone_gl_proxy.log", "log:xboxone_gl_proxy.log")
+            << LinkFor(L"latest.log", "game-log:latest.log")
+            << LinkFor(L"fabric-loader.log", "game-log:fabric-loader.log")
+            << LinkFor(L"xbox_compat.log", "game:xbox_compat.log")
+            << "</ul></div><div class=\"card\"><h2>Crash reports</h2><ul>";
+
+        WIN32_FIND_DATAW fd = {};
+        HANDLE h = FindFirstFileW((CrashReportsDir(runtimeRoot_) + L"\\*").c_str(), &fd);
+        bool anyCrash = false;
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                const std::wstring name = fd.cFileName;
+                const std::wstring lower = ToLowerW(name);
+                if ((lower.size() >= 4 && lower.substr(lower.size() - 4) == L".zip") ||
+                    (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".txt")) {
+                    anyCrash = true;
+                    out << LinkFor(name, "crash:" + FormUrlEncode(w2a(name)));
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        if (!anyCrash) out << "<li class=\"muted\">No crash reports yet.</li>";
+        out << "</ul></div>";
+        return out.str();
+    }
+
+    void ServeDownload(SOCKET s, const std::string& query) {
+        const std::string file = QueryValue(query, "file");
+        std::wstring path;
+        std::wstring name;
+        if (file.rfind("log:", 0) == 0) {
+            name = a2w(file.substr(4).c_str());
+            if (name.find(L'\\') != std::wstring::npos || name.find(L'/') != std::wstring::npos) {
+                SendHttpResponse(s, 400, "Bad Request", "text/plain; charset=utf-8", "Bad file.");
+                return;
+            }
+            path = runtimeRoot_ + L"\\" + name;
+        } else if (file.rfind("game-log:", 0) == 0) {
+            name = a2w(file.substr(9).c_str());
+            if (name.find(L'\\') != std::wstring::npos || name.find(L'/') != std::wstring::npos) {
+                SendHttpResponse(s, 400, "Bad Request", "text/plain; charset=utf-8", "Bad file.");
+                return;
+            }
+            path = runtimeRoot_ + L"\\game\\logs\\" + name;
+        } else if (file.rfind("game:", 0) == 0) {
+            name = a2w(file.substr(5).c_str());
+            if (name.find(L'\\') != std::wstring::npos || name.find(L'/') != std::wstring::npos) {
+                SendHttpResponse(s, 400, "Bad Request", "text/plain; charset=utf-8", "Bad file.");
+                return;
+            }
+            path = runtimeRoot_ + L"\\game\\" + name;
+        } else if (file.rfind("crash:", 0) == 0) {
+            name = a2w(UrlDecode(file.substr(6)).c_str());
+            if (name.find(L'\\') != std::wstring::npos || name.find(L'/') != std::wstring::npos) {
+                SendHttpResponse(s, 400, "Bad Request", "text/plain; charset=utf-8", "Bad file.");
+                return;
+            }
+            path = CrashReportsDir(runtimeRoot_) + L"\\" + name;
+        } else {
+            SendHttpResponse(s, 400, "Bad Request", "text/plain; charset=utf-8", "Bad file.");
+            return;
+        }
+        SendHttpFile(s, path, w2a(name), GuessDownloadContentType(name));
+    }
+
+    bool ExtractMultipartFile(
+        const std::map<std::string, std::string>& headers,
+        const std::string& body,
+        std::wstring& fileName,
+        std::vector<unsigned char>& data) {
+        auto it = headers.find("content-type");
+        if (it == headers.end()) return false;
+        const std::string marker = "boundary=";
+        const size_t bpos = it->second.find(marker);
+        if (bpos == std::string::npos) return false;
+        std::string rawBoundary = it->second.substr(bpos + marker.size());
+        if (!rawBoundary.empty() && rawBoundary.front() == '"' && rawBoundary.back() == '"') {
+            rawBoundary = rawBoundary.substr(1, rawBoundary.size() - 2);
+        }
+        std::string boundary = "--" + rawBoundary;
+
+        size_t pos = 0;
+        while (true) {
+            const size_t partStart = body.find(boundary, pos);
+            if (partStart == std::string::npos) return false;
+            const size_t headerStart = body.find("\r\n", partStart);
+            if (headerStart == std::string::npos) return false;
+            const size_t headerEnd = body.find("\r\n\r\n", headerStart + 2);
+            if (headerEnd == std::string::npos) return false;
+            const std::string partHeader = body.substr(headerStart + 2, headerEnd - headerStart - 2);
+            if (partHeader.find("name=\"file\"") != std::string::npos) {
+                const size_t fn = partHeader.find("filename=\"");
+                if (fn == std::string::npos) return false;
+                const size_t fnStart = fn + 10;
+                const size_t fnEnd = partHeader.find('"', fnStart);
+                if (fnEnd == std::string::npos) return false;
+                fileName = SafeFileName(a2w(partHeader.substr(fnStart, fnEnd - fnStart).c_str()));
+                const size_t dataStart = headerEnd + 4;
+                size_t dataEnd = body.find("\r\n" + boundary, dataStart);
+                if (dataEnd == std::string::npos || dataEnd < dataStart) return false;
+                data.assign(body.begin() + dataStart, body.begin() + dataEnd);
+                return !fileName.empty() && !data.empty();
+            }
+            pos = headerEnd + 4;
+        }
+    }
+
+    void HandleUpload(SOCKET s, const std::map<std::string, std::string>& headers, const std::string& body, bool modUpload) {
+        std::wstring name;
+        std::vector<unsigned char> data;
+        if (!ExtractMultipartFile(headers, body, name, data)) {
+            SendHttpResponse(s, 400, "Bad Request", "text/html; charset=utf-8", Layout("Upload failed", "<h1>Upload failed</h1><p>No file was received.</p>"));
+            return;
+        }
+
+        const std::wstring lower = ToLowerW(name);
+        const bool allowed = modUpload
+            ? (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".jar")
+            : (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".zip");
+        if (!allowed) {
+            SendHttpResponse(s, 400, "Bad Request", "text/html; charset=utf-8", Layout("Upload failed", "<h1>Upload failed</h1><p>Wrong file type.</p>"));
+            return;
+        }
+
+        std::wstring dir;
+        if (modUpload) {
+            EnsureProfilesInitialized(runtimeRoot_);
+            const std::wstring active = GetActiveProfileId(runtimeRoot_);
+            if (active == kVanillaProfileId) {
+                SendHttpResponse(s, 400, "Bad Request", "text/html; charset=utf-8", Layout("Upload failed", "<h1>Upload failed</h1><p>Vanilla is read only. Create or select a profile first.</p>"));
+                return;
+            }
+            dir = ProfileModsDir(runtimeRoot_, active);
+        } else {
+            dir = runtimeRoot_ + L"\\game\\resourcepacks";
+        }
+
+        EnsureDirectoryTree(dir);
+        const std::wstring path = dir + L"\\" + name;
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) {
+            SendHttpResponse(s, 500, "Internal Server Error", "text/html; charset=utf-8", Layout("Upload failed", "<h1>Upload failed</h1><p>Could not write the file.</p>"));
+            return;
+        }
+        const bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+        fclose(f);
+        if (!ok) {
+            DeleteFileW(path.c_str());
+            SendHttpResponse(s, 500, "Internal Server Error", "text/html; charset=utf-8", Layout("Upload failed", "<h1>Upload failed</h1><p>Could not finish writing the file.</p>"));
+            return;
+        }
+
+        WriteLogF(L"Remote file upload saved: %s bytes=%zu", path.c_str(), data.size());
+        SendHttpResponse(s, 200, "OK", "text/html; charset=utf-8",
+            Layout("Upload complete", "<h1>Upload complete</h1><p>Saved " + HtmlEscape(name) + ".</p><p><a href=\"/?pin=" + pin_ + "\">Back to files</a></p>"));
+    }
+};
+
+static RemoteFileServer g_remoteFileServer;
+
+static void StartRemoteFileServer(const std::wstring& runtimeRoot) {
+    g_remoteFileServer.Start(runtimeRoot);
+}
+
+static void StopRemoteFileServer() {
+    g_remoteFileServer.Stop();
+}
+
 static void StartInstallJob(const ModCard& card, const std::wstring& runtimeRoot, const LaunchTarget& target) {
     if (g_installRunning.load()) return;
     g_installRunning.store(true);
@@ -4816,6 +5375,7 @@ struct AuthUiState {
     bool isError = false;
     bool showDeviceCode = true;
     bool showMainMenu = false;
+    bool showRemoteFiles = false;
     bool showModsPage = false;
     int selectedMenuIndex = 0;
     int selectedModsTab = 0;
@@ -5482,12 +6042,12 @@ public:
             const float top = frame.top + 34.0f;
             const float buttonH = 62.0f;
             const float buttonGap = 24.0f;
-            const wchar_t* labels[] = { L"Play", L"Mods", L"Repair downloads", L"Sign out" };
+            const wchar_t* labels[] = { L"Play", L"Mods", L"Remote Files", L"Repair downloads", L"Sign out" };
 
             DrawText(title.c_str(), titleFormat_.Get(), D2D1::RectF(left, top, menuRight, top + 48.0f), white.Get());
 
-            const wchar_t* menuIcons[] = { L"\uE768", L"\uE74C", L"\uE72C", L"\uE7E8" };
-            for (int i = 0; i < 4; ++i) {
+            const wchar_t* menuIcons[] = { L"\uE768", L"\uE74C", L"\uE838", L"\uE72C", L"\uE7E8" };
+            for (int i = 0; i < 5; ++i) {
                 const float y = top + 76.0f + i * (buttonH + buttonGap);
                 const D2D1_RECT_F button = D2D1::RectF(left, y, menuRight, y + buttonH);
                 const bool sel = i == state.selectedMenuIndex;
@@ -5516,6 +6076,29 @@ public:
                 DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
             }
 
+            finishDraw();
+            return;
+        }
+
+        if (state.showRemoteFiles) {
+            const float left = frame.left + 54.0f;
+            const float right = frame.right - 54.0f;
+            const float top = frame.top + 58.0f;
+            DrawText(L"Remote Files", titleFormat_.Get(), D2D1::RectF(left, top, right, top + 58.0f), white.Get());
+            DrawText(state.status.c_str(), bodyFormat_.Get(), D2D1::RectF(left, top + 86.0f, right, top + 128.0f), accent.Get());
+
+            const D2D1_RECT_F box = D2D1::RectF(left, top + 152.0f, right, top + 336.0f);
+            FillRound(box, surfaceFill.Get(), 14.0f);
+            StrokeRound(box, softEdge.Get(), 14.0f, 1.0f);
+            DrawText(state.detail.c_str(), bodyMid_.Get(), D2D1::RectF(box.left + 24.0f, box.top + 20.0f, box.right - 24.0f, box.top + 92.0f), white.Get());
+            DrawText(
+                L"Download logs and crash reports from another device on the same network.\nUpload .jar mods to the active profile or .zip resource packs to the game folder.",
+                smallFormat_.Get(),
+                D2D1::RectF(box.left + 24.0f, box.top + 104.0f, box.right - 24.0f, box.bottom - 22.0f),
+                muted.Get());
+
+            const D2D1_RECT_F hint = D2D1::RectF(left, frame.bottom - 92.0f, right, frame.bottom - 36.0f);
+            DrawText(L"Press B or Escape to stop sharing and return to the launcher.", smallFormat_.Get(), hint, muted.Get());
             finishDraw();
             return;
         }
@@ -7021,6 +7604,50 @@ static void ShowModsPage(
     }
 }
 
+static void ShowRemoteFilesPage(ICoreWindow* window, AuthScreenRenderer* renderer, AuthUiState& state, const std::wstring& runtimeRoot) {
+    WriteLog(L"Remote files page opened");
+    StartRemoteFileServer(runtimeRoot);
+
+    state.showMainMenu = false;
+    state.showModsPage = false;
+    state.showRemoteFiles = true;
+    state.showDeviceCode = false;
+    state.isError = false;
+
+    bool backWasDown = false;
+    while (true) {
+        if (g_remoteFileServer.Running()) {
+            state.status = L"Remote file manager is running";
+            state.detail = L"Open " + g_remoteFileServer.Url() + L"\nPIN: " + a2w(g_remoteFileServer.Pin().c_str());
+        } else {
+            state.status = L"Remote file manager is not running";
+            state.detail = L"Could not start the LAN server on port 27632. Check that another copy is not already running.";
+            state.isError = true;
+        }
+
+        state.animation = static_cast<float>((GetTickCount64() % 100000) / 1000.0);
+        RenderAuth(renderer, state);
+
+        const bool backDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Escape,
+            ABI::Windows::System::VirtualKey_GamepadB
+        });
+        if (backDown && !backWasDown) {
+            StopRemoteFileServer();
+            state.showRemoteFiles = false;
+            state.showMainMenu = true;
+            state.isError = false;
+            state.status = L"Remote file manager stopped";
+            state.detail = L"";
+            WriteLog(L"Remote files page closed");
+            return;
+        }
+
+        backWasDown = backDown;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
 static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& authConfig, const std::wstring& runtimeRoot) {
     AuthScreenRenderer rendererInstance;
     AuthScreenRenderer* renderer = nullptr;
@@ -7072,16 +7699,17 @@ static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& 
         });
 
         if (upDown && !upWasDown) {
-            selected = (selected + 3) % 4;
+            selected = (selected + 4) % 5;
             state.detail = L"";
         }
         if (downDown && !downWasDown) {
-            selected = (selected + 1) % 4;
+            selected = (selected + 1) % 5;
             state.detail = L"";
         }
         if (selectDown && !selectWasDown) {
             if (selected == 0) {
                 WriteLog(L"Main menu: Play selected");
+                StopRemoteFileServer();
                 return MainMenuAction::Play;
             }
             if (selected == 1) {
@@ -7089,7 +7717,11 @@ static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& 
                 ShowModsPage(window, renderer, state, runtimeRoot);
                 state.detail = L"Browse installed, popular, and latest Fabric mods.";
             } else if (selected == 2) {
+                WriteLog(L"Main menu: Remote files selected");
+                ShowRemoteFilesPage(window, renderer, state, runtimeRoot);
+            } else if (selected == 3) {
                 WriteLog(L"Main menu: Repair downloads selected");
+                StopRemoteFileServer();
                 state.status = L"Repairing downloaded files";
                 state.detail = L"Downloaded Minecraft files will be rechecked";
                 RenderAuth(renderer, state);
@@ -7097,6 +7729,7 @@ static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& 
                 return MainMenuAction::RepairDownloads;
             } else {
                 WriteLog(L"Main menu: Sign out selected");
+                StopRemoteFileServer();
                 state.status = L"Signing out";
                 state.detail = L"Clearing saved Microsoft session";
                 RenderAuth(renderer, state);
