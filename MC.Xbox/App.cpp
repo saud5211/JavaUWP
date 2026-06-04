@@ -9113,14 +9113,16 @@ public:
             }
         }
 
+        LaunchAuthConfig authConfig;
+        bool authConfigReady = false;
         for (;;) {
         bool repairDownloads = false;
-        LaunchAuthConfig authConfig;
         while (true) {
-            if (!ResolveLaunchAuthConfig(g_authWindow.Get(), authConfig)) {
+            if (!authConfigReady && !ResolveLaunchAuthConfig(g_authWindow.Get(), authConfig)) {
                 WriteLog(L"Dynamic authentication failed");
                 return E_FAIL;
             }
+            authConfigReady = true;
 
             const MainMenuAction menuAction = ShowMainMenu(g_authWindow.Get(), authConfig, exeDir);
             if (menuAction == MainMenuAction::Play) {
@@ -9132,6 +9134,8 @@ public:
             }
 
             ClearRefreshToken();
+            authConfig = LaunchAuthConfig{};
+            authConfigReady = false;
             WriteLog(L"Saved Microsoft refresh token cleared by sign out");
         }
 
@@ -9385,6 +9389,14 @@ public:
         }
         g_minecraftRunning.store(false);
         WriteLog(L"Minecraft session ended; returning to main menu");
+        SetCurrentDirectoryW(exeDir.c_str());
+        PublishCoreWindowProperty(g_authWindow.Get());
+        if (g_authWindow) {
+            g_authWindow->Activate();
+        }
+        ProcessAuthUiEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        ProcessAuthUiEvents();
         }
         return S_OK;
     }
