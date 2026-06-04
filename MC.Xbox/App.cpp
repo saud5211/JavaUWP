@@ -3770,9 +3770,8 @@ static std::wstring ModpackDestForRelative(const std::wstring& relRaw, const std
     return gameDir + L"\\" + rel;
 }
 
-static bool InstallModpack(const ModCard& card, const std::wstring& runtimeRoot, const std::wstring& userModsDir, std::wstring& error, const std::string& gameVersion, const std::string& loaderId) {
+static bool InstallModpack(const ModCard& card, const std::wstring& runtimeRoot, const std::wstring& gameDir, const std::wstring& userModsDir, std::wstring& error, const std::string& gameVersion, const std::string& loaderId) {
     using namespace winrt::Windows::Data::Json;
-    const std::wstring gameDir = runtimeRoot + L"\\game";
     const std::wstring idOrSlug = !card.projectId.empty() ? card.projectId : card.slug;
 
     SetInstallStatus(L"Resolving " + card.title + L"...");
@@ -4145,10 +4144,12 @@ struct Profile {
 
 static std::wstring ProfilesRoot(const std::wstring& runtimeRoot) { return runtimeRoot + L"\\profiles"; }
 static std::wstring ProfileDir(const std::wstring& runtimeRoot, const std::wstring& id) { return ProfilesRoot(runtimeRoot) + L"\\" + id; }
+static std::wstring ProfileGameDir(const std::wstring& runtimeRoot, const std::wstring& id) { return ProfileDir(runtimeRoot, id) + L"\\game"; }
 static std::wstring ProfileModsDir(const std::wstring& runtimeRoot, const std::wstring& id) { return ProfileDir(runtimeRoot, id) + L"\\mods"; }
 static std::wstring ProfilesJsonPath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\profiles.json"; }
 static std::wstring LegacyProfilesManifestPath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\profiles.txt"; }
 static std::wstring ActiveProfilePath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\active.txt"; }
+static std::wstring LegacyGameDataMigrationMarkerPath(const std::wstring& runtimeRoot) { return ProfilesRoot(runtimeRoot) + L"\\game_data_migrated.txt"; }
 
 static std::wstring MakeTargetId(const std::wstring& minecraftVersion, const std::wstring& loader, const std::wstring& loaderVersion) {
     return minecraftVersion + L"-" + loader + L"-" + (loaderVersion.empty() ? L"none" : loaderVersion);
@@ -4596,6 +4597,7 @@ static std::wstring CreateProfile(const std::wstring& runtimeRoot, const std::ws
     std::vector<Profile> profiles = LoadProfiles(runtimeRoot);
     const std::wstring id = MakeProfileId(runtimeRoot, name);
     EnsureDirectoryTree(ProfileModsDir(runtimeRoot, id));
+    EnsureDirectoryTree(ProfileGameDir(runtimeRoot, id));
     profiles.push_back(ProfileWithTarget(id, name.empty() ? id : StripNewlines(name), target, false));
     SaveProfiles(runtimeRoot, profiles);
     return id;
@@ -4629,6 +4631,7 @@ static void RenameProfile(const std::wstring& runtimeRoot, const std::wstring& i
 
 static void EnsureProfilesInitialized(const std::wstring& runtimeRoot) {
     EnsureDirectoryTree(ProfileModsDir(runtimeRoot, kVanillaProfileId));
+    EnsureDirectoryTree(ProfileGameDir(runtimeRoot, kVanillaProfileId));
     if (GetFileAttributesW(ProfilesJsonPath(runtimeRoot).c_str()) != INVALID_FILE_ATTRIBUTES) return;
     if (GetFileAttributesW(LegacyProfilesManifestPath(runtimeRoot).c_str()) != INVALID_FILE_ATTRIBUTES) {
         LoadProfiles(runtimeRoot);
@@ -4646,6 +4649,7 @@ static void EnsureProfilesInitialized(const std::wstring& runtimeRoot) {
     if (hasLegacy) {
         const std::wstring id = L"default";
         EnsureDirectoryTree(ProfileModsDir(runtimeRoot, id));
+        EnsureDirectoryTree(ProfileGameDir(runtimeRoot, id));
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             MoveFileExW((legacy + L"\\" + fd.cFileName).c_str(),
@@ -4659,6 +4663,46 @@ static void EnsureProfilesInitialized(const std::wstring& runtimeRoot) {
         SaveProfilesJson(runtimeRoot, profiles, kVanillaProfileId);
         SetActiveProfileId(runtimeRoot, kVanillaProfileId);
     }
+}
+
+static void MoveLegacyGameDataPathToProfile(const std::wstring& runtimeRoot, const std::wstring& profileId, const std::wstring& relativePath) {
+    const std::wstring source = runtimeRoot + L"\\game\\" + relativePath;
+    const DWORD attrs = GetFileAttributesW(source.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+
+    const std::wstring dest = ProfileGameDir(runtimeRoot, profileId) + L"\\" + relativePath;
+    if (GetFileAttributesW(dest.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        WriteLogF(L"Legacy game data migration skipped existing destination: %s", dest.c_str());
+        return;
+    }
+
+    EnsureDirectoryTree(GetParentDir(dest));
+    if (MoveFileExW(source.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        WriteLogF(L"Legacy game data migrated: %s -> %s", source.c_str(), dest.c_str());
+    } else {
+        WriteLogF(L"Legacy game data migration failed: %s -> %s err=%u", source.c_str(), dest.c_str(), GetLastError());
+    }
+}
+
+static void EnsureProfileGameDataInitialized(const std::wstring& runtimeRoot, const std::wstring& profileId) {
+    if (profileId.empty()) return;
+    EnsureDirectoryTree(ProfileGameDir(runtimeRoot, profileId));
+
+    const std::wstring marker = LegacyGameDataMigrationMarkerPath(runtimeRoot);
+    if (GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"saves");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"config");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"resourcepacks");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"screenshots");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"shaderpacks");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"server-resource-packs");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"options.txt");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"optionsof.txt");
+    MoveLegacyGameDataPathToProfile(runtimeRoot, profileId, L"servers.dat");
+
+    EnsureDirectoryTree(GetParentDir(marker));
+    WriteTextFile(marker, profileId + L"\n");
 }
 
 static std::vector<std::wstring> ListProfileMods(const std::wstring& runtimeRoot, const std::wstring& id) {
@@ -5201,7 +5245,10 @@ private:
             }
             dir = ProfileModsDir(runtimeRoot_, active);
         } else {
-            dir = runtimeRoot_ + L"\\game\\resourcepacks";
+            EnsureProfilesInitialized(runtimeRoot_);
+            const std::wstring active = GetActiveProfileId(runtimeRoot_);
+            EnsureProfileGameDataInitialized(runtimeRoot_, active);
+            dir = ProfileGameDir(runtimeRoot_, active) + L"\\resourcepacks";
         }
 
         EnsureDirectoryTree(dir);
@@ -5254,7 +5301,7 @@ static void StartInstallJob(const ModCard& card, const std::wstring& runtimeRoot
         if (copy.isModpack) {
             const std::wstring pid = CreateProfile(rootCopy, copy.title, targetCopy);
             WriteLogF(L"Installing modpack '%s' target=%s into profile %s", copy.title.c_str(), targetCopy.targetId.c_str(), pid.c_str());
-            ok = InstallModpack(copy, rootCopy, ProfileModsDir(rootCopy, pid), err, gameVersion, loaderId);
+            ok = InstallModpack(copy, rootCopy, ProfileGameDir(rootCopy, pid), ProfileModsDir(rootCopy, pid), err, gameVersion, loaderId);
             if (ok) {
                 SetActiveProfileId(rootCopy, pid);
                 SetInstallStatus(L"Installed profile " + copy.title);
@@ -8636,7 +8683,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         suppliedNativesReady ? nativesDir :
         (packagedNativesReady ? packagedNativesDir : nativesDir);
     const std::wstring lwjglGlfwDll = lwjglNativeDir + L"\\glfw.dll";
-    const std::wstring logConfigPath = gameDir + L"\\log_configs\\client-uwp.xml";
+    const std::wstring logConfigPath = exeDir + L"\\game\\log_configs\\client-uwp.xml";
     const std::wstring fabricLogPath = gameDir + L"\\logs\\fabric-loader.log";
     const std::wstring latestLogPath = gameDir + L"\\logs\\latest.log";
     const std::wstring xboxCompatLogPath = gameDir + L"\\xbox_compat.log";
@@ -9217,7 +9264,11 @@ public:
 
         const JavaRuntimeInfo javaRuntime = ResolveJavaRuntimeInfo(packageDir, exeDir, versionInfo.javaRuntime);
         const std::wstring jreDir = javaRuntime.selectedDir;
-        const std::wstring gameDir = exeDir + L"\\game";
+        EnsureProfilesInitialized(exeDir);
+        const std::wstring activeProfile = GetActiveProfileId(exeDir);
+        EnsureProfileGameDataInitialized(exeDir, activeProfile);
+        const std::wstring sharedGameDir = exeDir + L"\\game";
+        const std::wstring gameDir = ProfileGameDir(exeDir, activeProfile);
         const std::wstring javaExe = jreDir + L"\\bin\\java.exe";
         const std::wstring assetsDir = exeDir + L"\\assets";
         const std::wstring localNativesDir = exeDir + L"\\natives";
@@ -9241,10 +9292,8 @@ public:
         const std::wstring packageRuntimeDir = packageDir + L"\\runtime";
         const std::wstring packagedLibrariesDir = packageRuntimeDir + L"\\libraries";
         const std::wstring bundledModsDir = versionInfo.bundledModsDir;
-        EnsureProfilesInitialized(exeDir);
-        const std::wstring activeProfile = GetActiveProfileId(exeDir);
         const std::wstring userModsDir = ProfileModsDir(exeDir, activeProfile);
-        const std::wstring clientJar = gameDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
+        const std::wstring clientJar = sharedGameDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
         const std::wstring argsPath = exeDir + L"\\java_args.txt";
         const std::wstring javaLog = exeDir + L"\\java_output.log";
 
@@ -9261,7 +9310,9 @@ public:
         WriteLogF(L"package target jre release stamp: %s", FileStamp(javaRuntime.packageDir + L"\\release").c_str());
         WriteLogF(L"nativesDir: %s", nativesDir.c_str());
         WriteLogF(L"packagedLibrariesDir: %s", packagedLibrariesDir.c_str());
-        WriteLogF(L"downloadedLibrariesDir: %s", (gameDir + L"\\libraries").c_str());
+        WriteLogF(L"sharedGameDir: %s", sharedGameDir.c_str());
+        WriteLogF(L"profileGameDir: %s", gameDir.c_str());
+        WriteLogF(L"downloadedLibrariesDir: %s", (sharedGameDir + L"\\libraries").c_str());
         WriteLogF(L"bundledModsDir: %s", bundledModsDir.c_str());
         WriteLogF(L"userModsDir: %s", userModsDir.c_str());
         const int blockedRemoved = PurgeBlockedModsFromDir(exeDir, userModsDir);
