@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -9,7 +10,20 @@
 #include "minecraft_auth.h"
 #include "runtime_manager.h"
 
+struct LaunchUiSnapshot {
+    std::wstring status;
+    std::wstring detail;
+    float progress = 0.1f;
+    std::wstring logTail;
+    bool graphicsReady = false;
+};
+
 std::wstring ReadLaunchLogTailForUi(const std::vector<std::wstring>& paths, size_t maxLines = 9);
+LaunchUiSnapshot BuildLaunchUiSnapshot(
+    const std::vector<std::wstring>& launchLogPaths,
+    const std::wstring& glfwLogPath,
+    const std::wstring& latestLogPath,
+    const std::wstring& loaderLabel);
 void CollectJars(const std::wstring& dir, std::vector<std::wstring>& jars);
 void CollectManifestLibraryJars(
     const std::wstring& manifestPath,
@@ -17,6 +31,8 @@ void CollectManifestLibraryJars(
     const std::wstring& packageDir,
     std::vector<std::wstring>& jars);
 bool PublishCoreWindowProperty(ABI::Windows::UI::Core::ICoreWindow* window);
+
+using LaunchProgressCallback = std::function<void(const wchar_t* status, const wchar_t* detail, float progress)>;
 
 bool RunEmbeddedMinecraft(
     const std::wstring& exeDir,
@@ -47,4 +63,5 @@ bool RunEmbeddedMinecraft(
     const std::wstring& neoForgeJarSplitterVersion,
     const std::wstring& neoForgeBinaryPatcherVersion,
     const std::wstring& neoForgeAutoRenamingToolVersion,
-    const LaunchAuthConfig& authConfig);
+    const LaunchAuthConfig& authConfig,
+    LaunchProgressCallback progress = {});

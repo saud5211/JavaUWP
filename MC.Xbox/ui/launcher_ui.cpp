@@ -4,6 +4,7 @@
 #include "auth_screen.h"
 #include "launcher_common.h"
 #include "minecraft_auth.h"
+#include "minecraft_launch.h"
 #include "profiles.h"
 #include "remote_file_server.h"
 #include "qr_code.h"
@@ -101,6 +102,37 @@ void RenderPreparationProgress(
     state.secondsRemaining = 0;
     state.isError = false;
     RenderAuth(renderer, state);
+}
+
+bool RunLaunchTaskWithLiveUi(
+    AuthScreenRenderer* renderer,
+    AuthUiState& state,
+    const std::vector<std::wstring>& launchLogPaths,
+    const std::wstring& loaderLabel,
+    const std::function<bool(LaunchProgressCallback progress)>& launchTask) {
+    state.title = L"Preparing Minecraft";
+    state.showDeviceCode = false;
+    state.showLaunchLog = true;
+    state.isError = false;
+    state.secondsRemaining = 0;
+    state.status = L"Starting Minecraft";
+    state.detail = loaderLabel.empty()
+        ? L"Preparing launch files."
+        : (L"Preparing " + loaderLabel + L" and launch files.");
+    state.progress = 0.12f;
+    state.launchLogText = ReadLaunchLogTailForUi(launchLogPaths);
+    RenderAuth(renderer, state);
+
+    LaunchProgressCallback progress = [&](const wchar_t* status, const wchar_t* detail, float value) {
+        state.status = status ? status : L"Starting Minecraft";
+        state.detail = detail ? detail : L"";
+        state.progress = value;
+        state.launchLogText = ReadLaunchLogTailForUi(launchLogPaths);
+        state.animation = static_cast<float>((GetTickCount64() % 100000) / 1000.0);
+        RenderAuth(renderer, state);
+    };
+
+    return launchTask(progress);
 }
 
 static void ShowRemoteFilesPage(ICoreWindow* window, AuthScreenRenderer* renderer, AuthUiState& state, const std::wstring& runtimeRoot) {

@@ -126,6 +126,84 @@ std::wstring ReadLaunchLogTailForUi(const std::vector<std::wstring>& paths, size
     }
     return L"Waiting for pre-launch log output...";
 }
+
+static bool FileContains(const std::wstring& path, const wchar_t* needle) {
+    if (!needle || !*needle) return false;
+    std::wstring text;
+    if (!ReadTextFile(path, text) || text.empty()) return false;
+    return text.find(needle) != std::wstring::npos;
+}
+
+LaunchUiSnapshot BuildLaunchUiSnapshot(
+    const std::vector<std::wstring>& launchLogPaths,
+    const std::wstring& glfwLogPath,
+    const std::wstring& latestLogPath,
+    const std::wstring& loaderLabel) {
+    LaunchUiSnapshot snap;
+    snap.logTail = ReadLaunchLogTailForUi(launchLogPaths);
+    snap.status = L"Starting Minecraft";
+    snap.detail = loaderLabel.empty()
+        ? L"Preparing the Java runtime and launch files."
+        : (L"Preparing " + loaderLabel + L" and the Java runtime.");
+    snap.progress = 0.12f;
+
+    std::wstring mcLaunch;
+    for (const std::wstring& path : launchLogPaths) {
+        std::wstring text;
+        if (ReadTextFile(path, text) && !text.empty()) {
+            mcLaunch = std::move(text);
+            break;
+        }
+    }
+
+    if (!mcLaunch.empty()) {
+        if (mcLaunch.find(L"Launching embedded JVM") != std::wstring::npos) {
+            snap.progress = 0.22f;
+            snap.status = L"Starting Java runtime";
+            snap.detail = L"The embedded JVM is loading.";
+        }
+        if (mcLaunch.find(L"JNI_CreateJavaVM") != std::wstring::npos) {
+            snap.progress = (std::max)(snap.progress, 0.34f);
+            snap.status = L"Starting Java runtime";
+            snap.detail = L"Java is online. Loader startup comes next.";
+        }
+        if (mcLaunch.find(L"Invoking ") != std::wstring::npos) {
+            snap.progress = (std::max)(snap.progress, 0.50f);
+            snap.status = loaderLabel.empty() ? L"Loading Minecraft" : (L"Loading " + loaderLabel);
+            snap.detail = L"Mods and libraries are being prepared. First launch can take a while.";
+        }
+        if (mcLaunch.find(L"NeoForge") != std::wstring::npos &&
+            mcLaunch.find(L"deploy") != std::wstring::npos) {
+            snap.progress = (std::max)(snap.progress, 0.42f);
+            snap.status = L"Preparing NeoForge";
+            snap.detail = L"NeoForge client files are being prepared.";
+        }
+    }
+
+    std::wstring latest;
+    if (ReadTextFile(latestLogPath, latest) && latest.size() > 180) {
+        snap.progress = (std::max)(snap.progress, 0.58f);
+        if (!snap.graphicsReady) {
+            snap.status = L"Bootstrapping Minecraft";
+            snap.detail = L"Minecraft is initializing in the background.";
+        }
+    }
+
+    if (FileContains(glfwLogPath, L"glfwInit OK")) {
+        snap.graphicsReady = true;
+        snap.progress = (std::max)(snap.progress, 0.86f);
+        snap.status = L"Opening Minecraft";
+        snap.detail = L"Graphics are starting. The Mojang loading screen should appear shortly.";
+    }
+    if (FileContains(glfwLogPath, L"glfwCreateWindow")) {
+        snap.graphicsReady = true;
+        snap.progress = (std::max)(snap.progress, 0.93f);
+        snap.status = L"Opening Minecraft";
+        snap.detail = L"The game window is ready. Minecraft should take over any moment.";
+    }
+
+    return snap;
+}
 static void LogTextFileTail(const std::wstring& path, const wchar_t* label, DWORD maxBytes = 16384) {
     int fd = -1;
     errno_t openErr = _wsopen_s(&fd, path.c_str(), _O_RDONLY | _O_BINARY, _SH_DENYNO, _S_IREAD);
@@ -847,9 +925,28 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring& neoForgeJarSplitterVersion,
     const std::wstring& neoForgeBinaryPatcherVersion,
     const std::wstring& neoForgeAutoRenamingToolVersion,
-    const LaunchAuthConfig& authConfig)
+    const LaunchAuthConfig& authConfig,
+    LaunchProgressCallback progress)
 {
+    const auto reportProgress = [&](const wchar_t* status, const wchar_t* detail, float value) {
+        if (progress) {
+            progress(status, detail, value);
+        }
+    };
+
     const LoaderId loaderId = ParseLoaderId(loader);
+    std::wstring loaderLabel = L"Minecraft";
+    if (loaderId == LoaderId::Fabric) {
+        loaderLabel = L"Fabric";
+    } else if (loaderId == LoaderId::NeoForge) {
+        loaderLabel = L"NeoForge";
+    } else if (loaderId == LoaderId::Forge) {
+        loaderLabel = L"Forge";
+    }
+    reportProgress(
+        L"Starting Minecraft",
+        (L"Preparing " + loaderLabel + L" and launch files.").c_str(),
+        0.12f);
     const std::wstring effectiveMainClass = LoaderDefaultMainClass(loaderId, mainClassName);
     std::wstring mainClassPath = effectiveMainClass;
     std::replace(mainClassPath.begin(), mainClassPath.end(), L'.', L'/');
@@ -1125,6 +1222,10 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
     fclose(af);
     WriteLog(L"Embedded JVM options written");
+    reportProgress(
+        L"Starting Java runtime",
+        L"Loading the embedded JVM.",
+        0.24f);
 
     HMODULE jvmModule = nullptr;
     if (!PreloadJvm(exeDir, jreDir, packagedJreRelativeDir, nativesDir, &jvmModule)) {
@@ -1156,10 +1257,18 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     if (createResult != JNI_OK || !vm || !env) {
         return false;
     }
+    reportProgress(
+        L"Starting Java runtime",
+        L"Java is online. Preparing loader startup next.",
+        0.38f);
 
     if (!LoaderPrepareArtifactsAfterJvm(env, loaderCtx, effectiveClassPath, neoForgeStartedWithGameClassPath)) {
         return false;
     }
+    reportProgress(
+        (L"Loading " + loaderLabel).c_str(),
+        L"Loader artifacts are ready. Minecraft main is starting next.",
+        0.52f);
 
     jclass mainClass = env->FindClass(w2a(mainClassPath).c_str());
     if (!mainClass || CheckAndLogJavaException(env, (L"FindClass(" + effectiveMainClass + L")").c_str())) {
@@ -1194,6 +1303,10 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
 
     WriteLogF(L"Invoking %s.main via embedded JVM", effectiveMainClass.c_str());
+    reportProgress(
+        (L"Loading " + loaderLabel).c_str(),
+        L"Mods and libraries are starting. The Mojang loading screen appears once graphics initialize.",
+        0.64f);
     WriteTextFile(CrashLaunchMarkerPath(exeDir),
         std::wstring(L"minecraftVersion=") + minecraftVersion + L"\n" +
         L"launchVersion=" + launchVersion + L"\n" +

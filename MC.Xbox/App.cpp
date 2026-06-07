@@ -619,58 +619,59 @@ public:
             launchRenderer = &launchRendererInstance;
         }
         AuthUiState launchState;
-        launchState.showLaunchLog = true;
-        launchState.launchLogText = ReadLaunchLogTailForUi(launchLogPaths);
-        const std::wstring launchDetail = L"Handing off to Minecraft. The game window will take over once GLFW starts.";
-        RenderPreparationProgress(
-            launchRenderer,
-            launchState,
-            L"Starting modpack",
-            launchDetail.c_str(),
-            -1.0f);
-        ProcessAuthUiEvents();
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-        launchState.launchLogText = ReadLaunchLogTailForUi(launchLogPaths);
-        RenderPreparationProgress(
-            launchRenderer,
-            launchState,
-            L"Starting modpack",
-            launchDetail.c_str(),
-            -1.0f);
-        ProcessAuthUiEvents();
+        DeleteFileW((g_logDir + L"\\glfw_uwp.log").c_str());
+
+        std::wstring loaderLabel = L"Minecraft";
+        if (versionInfo.loader == L"fabric") {
+            loaderLabel = L"Fabric";
+        } else if (versionInfo.loader == L"neoforge") {
+            loaderLabel = L"NeoForge";
+        } else if (versionInfo.loader == L"forge") {
+            loaderLabel = L"Forge";
+        }
+
         g_minecraftRunning.store(true);
         const std::wstring effLaunchVersion = versionInfo.launchVersion.empty() ? a2w(kFabricLaunchVersion) : versionInfo.launchVersion;
         const std::wstring effAssetIndex = versionInfo.assetIndex.empty() ? a2w(kMinecraftAssetIndex) : versionInfo.assetIndex;
-        if (!RunEmbeddedMinecraft(
-                exeDir,
-                packageDir,
-                jreDir,
-            javaRuntime.packageRelativeDir,
-            javaRuntime.javaBasePatchName,
-            javaRuntime.zipfsPatchName,
-            gameDir,
-                assetsDir,
-                nativesDir,
-                bundledModsDir,
-                userModsDir,
-                clientJar,
-                javaLog,
-                argsPath,
-                cp,
-                effLaunchVersion,
-                effAssetIndex,
-                minecraftVersion,
-                versionInfo.loader,
-                versionInfo.loaderVersion,
-                versionInfo.mainClass,
-                versionInfo.extraJvmArgs,
-                versionInfo.extraGameArgs,
-                versionInfo.neoFormVersion,
-                versionInfo.neoForgeInstallToolsVersion,
-                versionInfo.neoForgeJarSplitterVersion,
-                versionInfo.neoForgeBinaryPatcherVersion,
-                versionInfo.neoForgeAutoRenamingToolVersion,
-                authConfig)) {
+        const bool launched = RunLaunchTaskWithLiveUi(
+            launchRenderer,
+            launchState,
+            launchLogPaths,
+            loaderLabel,
+            [&](LaunchProgressCallback progress) {
+                return RunEmbeddedMinecraft(
+                    exeDir,
+                    packageDir,
+                    jreDir,
+                    javaRuntime.packageRelativeDir,
+                    javaRuntime.javaBasePatchName,
+                    javaRuntime.zipfsPatchName,
+                    gameDir,
+                    assetsDir,
+                    nativesDir,
+                    bundledModsDir,
+                    userModsDir,
+                    clientJar,
+                    javaLog,
+                    argsPath,
+                    cp,
+                    effLaunchVersion,
+                    effAssetIndex,
+                    minecraftVersion,
+                    versionInfo.loader,
+                    versionInfo.loaderVersion,
+                    versionInfo.mainClass,
+                    versionInfo.extraJvmArgs,
+                    versionInfo.extraGameArgs,
+                    versionInfo.neoFormVersion,
+                    versionInfo.neoForgeInstallToolsVersion,
+                    versionInfo.neoForgeJarSplitterVersion,
+                    versionInfo.neoForgeBinaryPatcherVersion,
+                    versionInfo.neoForgeAutoRenamingToolVersion,
+                    authConfig,
+                    progress);
+            });
+        if (!launched) {
             g_minecraftRunning.store(false);
             WriteLog(L"Embedded JVM launch failed");
             AuthScreenRenderer failedRendererInstance;

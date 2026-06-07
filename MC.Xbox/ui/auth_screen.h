@@ -748,19 +748,34 @@ public:
                 d2dContext_->PopAxisAlignedClip();
             }
 
-            if (state.progress >= 0.0f) {
-                const float progress = (std::max)(0.0f, (std::min)(1.0f, state.progress));
+            {
                 const float barTop = frame.bottom - 130.0f;
                 const float barHeight = 18.0f;
+                const float trackWidth = right - left;
                 const D2D1_RECT_F track = D2D1::RectF(left, barTop, right, barTop + barHeight);
-                const D2D1_RECT_F fill = D2D1::RectF(left, barTop, left + (right - left) * progress, barTop + barHeight);
-                FillRound(track, panel.Get(), 9.0f);
-                FillRound(fill, state.isError ? danger.Get() : accent.Get(), 9.0f);
 
-                wchar_t percent[32] = {};
-                swprintf_s(percent, L"%d%%", static_cast<int>(progress * 100.0f + 0.5f));
-                const D2D1_RECT_F percentRect = D2D1::RectF(left, barTop + 28.0f, left + 140.0f, barTop + 68.0f);
-                DrawText(percent, smallFormat_.Get(), percentRect, muted.Get());
+                if (state.progress >= 0.0f) {
+                    const float progress = (std::max)(0.0f, (std::min)(1.0f, state.progress));
+                    const D2D1_RECT_F fill = D2D1::RectF(left, barTop, left + trackWidth * progress, barTop + barHeight);
+                    FillRound(track, panel.Get(), 9.0f);
+                    FillRound(fill, state.isError ? danger.Get() : accent.Get(), 9.0f);
+
+                    wchar_t percent[32] = {};
+                    swprintf_s(percent, L"%d%%", static_cast<int>(progress * 100.0f + 0.5f));
+                    const D2D1_RECT_F percentRect = D2D1::RectF(left, barTop + 28.0f, left + 140.0f, barTop + 68.0f);
+                    DrawText(percent, smallFormat_.Get(), percentRect, muted.Get());
+                } else {
+                    const float phase = state.animation * 6.2831853f;
+                    const float pulse = 0.5f + 0.5f * std::sin(phase);
+                    const float fillWidth = trackWidth * (0.28f + 0.34f * pulse);
+                    const float fillLeft = left + (trackWidth - fillWidth) * (0.5f + 0.5f * std::sin(phase * 0.65f));
+                    const D2D1_RECT_F fill = D2D1::RectF(fillLeft, barTop, fillLeft + fillWidth, barTop + barHeight);
+                    FillRound(track, panel.Get(), 9.0f);
+                    FillRound(fill, state.isError ? danger.Get() : accent.Get(), 9.0f);
+
+                    const D2D1_RECT_F percentRect = D2D1::RectF(left, barTop + 28.0f, left + 180.0f, barTop + 68.0f);
+                    DrawText(L"Loading...", smallFormat_.Get(), percentRect, muted.Get());
+                }
             }
 
             finishDraw();

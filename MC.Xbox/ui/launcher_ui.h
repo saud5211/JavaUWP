@@ -1,13 +1,16 @@
 #pragma once
 
+#include <functional>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 #include <windows.system.h>
 #include <windows.ui.core.h>
 
 #include "auth_ui_state.h"
 #include "minecraft_auth.h"
+#include "minecraft_launch.h"
 
 class AuthScreenRenderer;
 
@@ -32,6 +35,13 @@ void RenderPreparationProgress(
     const wchar_t* status,
     const wchar_t* detail,
     float progress);
+
+bool RunLaunchTaskWithLiveUi(
+    AuthScreenRenderer* renderer,
+    AuthUiState& state,
+    const std::vector<std::wstring>& launchLogPaths,
+    const std::wstring& loaderLabel,
+    const std::function<bool(LaunchProgressCallback progress)>& launchTask);
 
 MainMenuAction ShowMainMenu(
     ABI::Windows::UI::Core::ICoreWindow* window,
