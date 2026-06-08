@@ -409,6 +409,14 @@ public:
                 selectedInfo.mainClass.empty() ? L"(none)" : selectedInfo.mainClass.c_str(),
                 selectedInfo.loaderJar.empty() ? L"(none)" : selectedInfo.loaderJar.c_str(),
                 selectedInfo.bundledModsDir.empty() ? L"(none)" : selectedInfo.bundledModsDir.c_str());
+            std::wstring unsupportedDetail = TargetProfileText(selectedTarget) + L" is in the catalog, but ";
+            if (selectedInfo.manifestPath.empty()) {
+                unsupportedDetail += L"its download manifest is missing from the installed package. Rebuild/reinstall the launcher with per-version manifests enabled.";
+            } else if (selectedInfo.assetIndex.empty() || selectedInfo.launchVersion.empty() || selectedInfo.mainClass.empty()) {
+                unsupportedDetail += L"its download manifest is incomplete. Reinstall the latest launcher build.";
+            } else {
+                unsupportedDetail += L"its launch provider is not available in this build yet.";
+            }
             AuthScreenRenderer unsupportedRendererInstance;
             AuthScreenRenderer* unsupportedRenderer = nullptr;
             if (unsupportedRendererInstance.Initialize(g_authWindow.Get())) {
@@ -419,7 +427,7 @@ public:
                 unsupportedRenderer,
                 unsupportedState,
                 L"Unsupported launch target",
-                (TargetProfileText(selectedTarget) + L" is cataloged, but its launch provider is not implemented yet").c_str(),
+                unsupportedDetail.c_str(),
                 1.0f);
             SleepWithAuthUi(unsupportedRenderer, unsupportedState, 8000);
             continue;

@@ -30,6 +30,8 @@ void LoaderFinalizeVersionInfo(
 void LoaderBeforeLaunch(const LoaderPreLaunchContext& ctx) {
     if (IsLoader(ctx.versionInfo.loader, LoaderId::NeoForge)) {
         NeoForgeBeforeLaunch(ctx);
+    } else if (IsLoader(ctx.versionInfo.loader, LoaderId::Forge)) {
+        ForgeBeforeLaunch(ctx);
     }
 }
 
@@ -55,6 +57,8 @@ void LoaderAdjustClasspath(const LoaderJvmContext& ctx, std::wstring& classPath,
     result.effectiveClassPath = classPath;
     if (ctx.loader == LoaderId::NeoForge) {
         NeoForgeAdjustClasspath(ctx, classPath, result);
+    } else if (ctx.loader == LoaderId::Forge) {
+        ForgeAdjustClasspath(ctx, classPath, result);
     }
 }
 
@@ -79,6 +83,11 @@ bool LoaderPrepareArtifactsAfterJvm(
     const LoaderJvmContext& ctx,
     std::wstring& effectiveClassPath,
     bool neoForgeStartedWithGameClassPath) {
-    if (ctx.loader != LoaderId::NeoForge) return true;
-    return NeoForgePrepareArtifactsAfterJvm(env, ctx, effectiveClassPath, neoForgeStartedWithGameClassPath);
+    if (ctx.loader == LoaderId::NeoForge) {
+        return NeoForgePrepareArtifactsAfterJvm(env, ctx, effectiveClassPath, neoForgeStartedWithGameClassPath);
+    }
+    if (ctx.loader == LoaderId::Forge) {
+        return ForgePrepareArtifactsAfterJvm(env, ctx, effectiveClassPath, neoForgeStartedWithGameClassPath);
+    }
+    return true;
 }

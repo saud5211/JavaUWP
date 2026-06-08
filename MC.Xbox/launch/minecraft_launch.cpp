@@ -48,6 +48,14 @@ using namespace ABI::Windows::UI::Core;
 
 typedef jint(JNICALL* JNI_CreateJavaVM_t)(JavaVM**, void**, void*);
 
+static void DestroyEmbeddedJvm(JavaVM*& vm, JNIEnv*& env) {
+    if (!vm) return;
+    vm->DestroyJavaVM();
+    vm = nullptr;
+    env = nullptr;
+    WriteLog(L"Embedded JVM destroyed after launch preparation failure");
+}
+
 static constexpr wchar_t kEGLNativeWindowTypeProperty[] = L"EGLNativeWindowTypeProperty";
 
 static volatile LONG g_logTailerRunning = 0;
@@ -952,9 +960,12 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     std::replace(mainClassPath.begin(), mainClassPath.end(), L'.', L'/');
     const std::wstring libraryDir = exeDir + L"\\game\\libraries";
     const std::wstring neoForgeVersionForLaunch = NeoForgeVersionFromLaunchVersion(launchVersion);
-    const std::wstring neoFormVersionForLaunch = !neoFormVersion.empty()
+    std::wstring neoFormVersionForLaunch = !neoFormVersion.empty()
         ? neoFormVersion
         : FirstArgValue(extraGameArgs, L"--fml.neoFormVersion");
+    if (neoFormVersionForLaunch.empty() && loaderId == LoaderId::Forge) {
+        neoFormVersionForLaunch = FirstArgValue(extraGameArgs, L"--fml.mcpVersion");
+    }
     const std::wstring neoForgeUniversalJar =
         loaderId == LoaderId::NeoForge && !neoForgeVersionForLaunch.empty()
             ? libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoforge", neoForgeVersionForLaunch, L"universal")
@@ -1016,6 +1027,12 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     EnsureDirectoryTree(gameDir + L"\\showdown");
     EnsureDirectoryTree(exeDir + L"\\showdown");
     EnsureDirectoryTree(userModsDir);
+    if ((loaderId == LoaderId::Forge || loaderId == LoaderId::NeoForge) &&
+        !bundledModsDir.empty() &&
+        DirectoryExists(bundledModsDir)) {
+        CopyDirectoryContentsAlways(bundledModsDir, userModsDir);
+        WriteLogF(L"Synced bundled loader mods from %s to %s", bundledModsDir.c_str(), userModsDir.c_str());
+    }
     const int earlyBlockedRemoved = PurgeBlockedModsFromDir(exeDir, userModsDir);
     if (earlyBlockedRemoved > 0) {
         WriteLogF(L"Removed %d blocked mod(s) from active profile before configuring launch", earlyBlockedRemoved);
@@ -1186,6 +1203,10 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
     WriteLogF(L"Log4j configuration: %s", FileUriFromPath(logConfigPath).c_str());
     vmOptionStorage.push_back("-Djava.class.path=" + w2a(effectiveClassPath));
+    if (loaderId == LoaderId::Forge) {
+        vmOptionStorage.push_back("-DlegacyClassPath=" + w2a(effectiveClassPath));
+        WriteLog(L"Forge legacyClassPath aligned with game classpath");
+    }
     vmOptionStorage.push_back("-Duser.dir=" + w2a(fwd(gameDir)));
     vmOptionStorage.push_back("-Dlog4j.configurationFile=" + w2a(FileUriFromPath(logConfigPath)));
     vmOptionStorage.push_back("-XX:ErrorFile=" + w2a(fwd(gameDir + L"\\hs_err_pid%p.log")));
@@ -1263,6 +1284,7 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         0.38f);
 
     if (!LoaderPrepareArtifactsAfterJvm(env, loaderCtx, effectiveClassPath, neoForgeStartedWithGameClassPath)) {
+        DestroyEmbeddedJvm(vm, env);
         return false;
     }
     reportProgress(
@@ -1272,32 +1294,38 @@ bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     jclass mainClass = env->FindClass(w2a(mainClassPath).c_str());
     if (!mainClass || CheckAndLogJavaException(env, (L"FindClass(" + effectiveMainClass + L")").c_str())) {
+        DestroyEmbeddedJvm(vm, env);
         return false;
     }
 
     jmethodID mainMethod = env->GetStaticMethodID(mainClass, "main", "([Ljava/lang/String;)V");
     if (!mainMethod || CheckAndLogJavaException(env, L"GetStaticMethodID(main)")) {
+        DestroyEmbeddedJvm(vm, env);
         return false;
     }
 
     jclass stringClass = env->FindClass("java/lang/String");
     if (!stringClass || CheckAndLogJavaException(env, L"FindClass(String)")) {
+        DestroyEmbeddedJvm(vm, env);
         return false;
     }
 
     jobjectArray argv = env->NewObjectArray(static_cast<jsize>(appArgs.size()), stringClass, nullptr);
     if (!argv || CheckAndLogJavaException(env, L"NewObjectArray")) {
+        DestroyEmbeddedJvm(vm, env);
         return false;
     }
 
     for (jsize i = 0; i < static_cast<jsize>(appArgs.size()); ++i) {
         jstring value = env->NewStringUTF(appArgs[i].c_str());
         if (!value || CheckAndLogJavaException(env, L"NewStringUTF")) {
+            DestroyEmbeddedJvm(vm, env);
             return false;
         }
         env->SetObjectArrayElement(argv, i, value);
         env->DeleteLocalRef(value);
         if (CheckAndLogJavaException(env, L"SetObjectArrayElement")) {
+            DestroyEmbeddedJvm(vm, env);
             return false;
         }
     }

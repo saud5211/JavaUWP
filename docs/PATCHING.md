@@ -68,9 +68,10 @@ You can build a specific target with:
 
 ```powershell
 .\compat_mod\build_compat_mod.ps1 -MinecraftVersion 1.19.2 -LoaderVersion 0.14.25
+.\compat_mod\build_compat_mod.ps1 -MinecraftVersion 1.20.1 -LoaderVersion 0.19.2
 ```
 
-The build disables mixins and sources that do not apply to the requested Minecraft version. Controller sources are included for legacy controller targets such as `1.16.5` and `1.19.2`, and excluded from modern targets where Controlify is the expected controller mod.
+The build disables mixins and sources that do not apply to the requested Minecraft version. Controller sources are included for bundled-controller targets such as `1.16.5`, `1.19.2`, and `1.20.1`, and excluded from modern targets where Controlify is the expected controller mod.
 
 The top level package step places the default compatibility mod under `runtime\bundled-mods`, and places per target compatibility mod jars under `runtime\version-mods\<target-id>`. The UWP host copies the right launcher owned mods into the active profile's writable game folder on launch.
 

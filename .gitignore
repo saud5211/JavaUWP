@@ -1,4 +1,9 @@
 # Build outputs
+/build/forge-installer.jar
+/runtime/
+/META-INF/
+/banditvault/
+/net/
 /PackageContent/
 /MC_Java_*.appx
 *.appxbundle

@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="banditvault_forge_controller"
+version="1.0.4"
+displayName="Bandit Forge Controller"
+authors="Bandit Launcher"
+description='''
+Xbox controller support for Bandit Launcher on Forge 1.20.1.
+'''
+features = { java_version = "[17,)" }
+
+[[dependencies.banditvault_forge_controller]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="CLIENT"
+
+[[dependencies.banditvault_forge_controller]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.21)"
+ordering="NONE"
+side="CLIENT"

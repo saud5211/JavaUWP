@@ -185,9 +185,10 @@ bool SeedLocalRuntime(
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\jre", localDir + L"\\jre");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\jre21", localDir + L"\\jre21");
+    CopyDirectoryContentsIfNeeded(packageDir + L"\\jre17", localDir + L"\\jre17");
     std::wstring xboxSecurityProperties;
     if (ReadTextFile(packageDir + L"\\xbox_security.properties", xboxSecurityProperties)) {
-        const std::wstring runtimeDirs[] = { L"jre", L"jre21" };
+        const std::wstring runtimeDirs[] = { L"jre", L"jre21", L"jre17" };
         for (const std::wstring& runtimeDir : runtimeDirs) {
             const std::wstring localSecurityDir = localDir + L"\\" + runtimeDir + L"\\conf\\security";
             if (GetFileAttributesW(localSecurityDir.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
@@ -1004,6 +1005,16 @@ JavaRuntimeInfo ResolveJavaRuntimeInfo(
         info.packageRelativeDir = L"jre21";
         info.javaBasePatchName = L"java-base-uwp-filesystem-21.jar";
         info.zipfsPatchName = L"java-zipfs-realpath-21.jar";
+    } else if (id == L"java17" || id == L"jdk17" || id == L"17") {
+        info.runtimeId = L"java17";
+        info.packageRelativeDir = L"jre17";
+        info.javaBasePatchName = L"java-base-uwp-filesystem-17.jar";
+        info.zipfsPatchName = L"java-zipfs-realpath-17.jar";
+    } else if (id == L"legacy" || id == L"java8" || id == L"jdk8" || id == L"8") {
+        info.runtimeId = L"legacy";
+        info.packageRelativeDir = L"jre8";
+        info.javaBasePatchName = L"java-base-uwp-filesystem-8.jar";
+        info.zipfsPatchName = L"java-zipfs-realpath-8.jar";
     } else {
         info.runtimeId = L"current";
         info.packageRelativeDir = L"jre";
@@ -1061,7 +1072,7 @@ static void ReadManifestHeader(
         else if (key == "mainClass") mainClass = a2w(val.c_str());
         else if (key == "jvmArgs") extraJvmArgs = SplitManifestValueList(a2w(val.c_str()));
         else if (key == "gameArgs") extraGameArgs = SplitManifestValueList(a2w(val.c_str()));
-        else if (key == "neoFormVersion") neoFormVersion = a2w(val.c_str());
+        else if (key == "neoFormVersion" || key == "forgeMcpVersion") neoFormVersion = a2w(val.c_str());
         else if (key == "neoForgeInstallToolsVersion") neoForgeInstallToolsVersion = a2w(val.c_str());
         else if (key == "neoForgeJarSplitterVersion") neoForgeJarSplitterVersion = a2w(val.c_str());
         else if (key == "neoForgeBinaryPatcherVersion") neoForgeBinaryPatcherVersion = a2w(val.c_str());

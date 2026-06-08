@@ -536,6 +536,34 @@ if ($Loader -eq "neoforge") {
     if ($jarSplitterVersion) { $lines.Add("# neoForgeJarSplitterVersion`t$jarSplitterVersion") }
     if ($binaryPatcherVersion) { $lines.Add("# neoForgeBinaryPatcherVersion`t$binaryPatcherVersion") }
     if ($autoRenamingToolVersion) { $lines.Add("# neoForgeAutoRenamingToolVersion`t$autoRenamingToolVersion") }
+} elseif ($Loader -eq "forge") {
+    $neoFormVersion = Get-GameArgumentValue $gameArgs "--fml.neoFormVersion"
+    $mcpVersion = Get-GameArgumentValue $gameArgs "--fml.mcpVersion"
+    if ($neoFormVersion) {
+        $lines.Add("# neoFormVersion`t$neoFormVersion")
+    } elseif ($mcpVersion) {
+        $lines.Add("# forgeMcpVersion`t$mcpVersion")
+    }
+    $installToolsVersion = Get-LibraryVersion $installProfile "net.minecraftforge.installertools:installertools:"
+    if (-not $installToolsVersion) {
+        $installToolsVersion = Get-LibraryVersion $installProfile "net.neoforged.installertools:installertools:"
+    }
+    $jarSplitterVersion = Get-LibraryVersion $installProfile "net.minecraftforge.installertools:jarsplitter:"
+    if (-not $jarSplitterVersion) {
+        $jarSplitterVersion = Get-LibraryVersion $installProfile "net.neoforged.installertools:jarsplitter:"
+    }
+    $binaryPatcherVersion = Get-LibraryVersion $installProfile "net.minecraftforge.installertools:binarypatcher:"
+    if (-not $binaryPatcherVersion) {
+        $binaryPatcherVersion = Get-LibraryVersion $installProfile "net.neoforged.installertools:binarypatcher:"
+    }
+    $autoRenamingToolVersion = Get-LibraryVersion $installProfile "net.minecraftforge:AutoRenamingTool:"
+    if (-not $autoRenamingToolVersion) {
+        $autoRenamingToolVersion = Get-LibraryVersion $installProfile "net.neoforged:AutoRenamingTool:"
+    }
+    if ($installToolsVersion) { $lines.Add("# neoForgeInstallToolsVersion`t$installToolsVersion") }
+    if ($jarSplitterVersion) { $lines.Add("# neoForgeJarSplitterVersion`t$jarSplitterVersion") }
+    if ($binaryPatcherVersion) { $lines.Add("# neoForgeBinaryPatcherVersion`t$binaryPatcherVersion") }
+    if ($autoRenamingToolVersion) { $lines.Add("# neoForgeAutoRenamingToolVersion`t$autoRenamingToolVersion") }
 }
 $lines.Add("# path`tsha1`tsize`turl")
 foreach ($entry in $deduped) {

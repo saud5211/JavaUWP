@@ -488,6 +488,10 @@ $fabricTargets = @(
     Import-Csv -Path $versionCatalogSource -Delimiter "`t" |
         Where-Object { $_.loader -eq "fabric" -and $_.loaderVersion -and $_.loaderVersion -ne "selected" -and $_.loaderVersion -ne "none" }
 )
+$forgeTargets = @(
+    Import-Csv -Path $versionCatalogSource -Delimiter "`t" |
+        Where-Object { $_.loader -eq "forge" -and $_.loaderVersion -and $_.loaderVersion -ne "selected" -and $_.loaderVersion -ne "none" }
+)
 $manifestTargets = @(
     Import-Csv -Path $versionCatalogSource -Delimiter "`t" |
         Where-Object { $_.loader -and $_.loaderVersion -and $_.loaderVersion -ne "selected" -and $_.loaderVersion -ne "none" }
@@ -637,6 +641,21 @@ if (-not $SkipVersionCompat) {
                 -OutputDir $outDir
         } catch {
             Write-Warning "Per-version compat mod skipped for ${targetId}: $($_.Exception.Message)"
+            if (Test-Path $outDir) { Remove-Item -Recurse -Force $outDir }
+        }
+    }
+    foreach ($row in $forgeTargets) {
+        $lv = $row.loaderVersion
+        $targetId = "$($row.minecraftVersion)-forge-$lv"
+        $outDir = Join-Path $versionModsRoot $targetId
+        Write-Host "Building per-version forge controller mod: $targetId"
+        try {
+            & (Join-Path $root "forge_controller_mod\build_forge_controller_mod.ps1") `
+                -MinecraftVersion $row.minecraftVersion `
+                -ForgeVersion "$($row.minecraftVersion)-$lv" `
+                -OutputDir $outDir
+        } catch {
+            Write-Warning "Per-version Forge controller mod skipped for ${targetId}: $($_.Exception.Message)"
             if (Test-Path $outDir) { Remove-Item -Recurse -Force $outDir }
         }
     }
@@ -982,6 +1001,16 @@ $xboxSecurityProperties = Join-Path $root "xbox_security.properties"
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "xbox_security.properties") -Force
 Copy-PackagedJre -JavaHome $jreSrc -PackageRelativeDir "jre" -SecurityPropertiesPath $xboxSecurityProperties
 Copy-PackagedJre -JavaHome $jre21Src -PackageRelativeDir "jre21" -SecurityPropertiesPath $xboxSecurityProperties
+try {
+    $jre17Src = Resolve-JavaHomeExact -MajorVersion 17
+    Copy-PackagedJre -JavaHome $jre17Src -PackageRelativeDir "jre17" -SecurityPropertiesPath $xboxSecurityProperties
+    Build-JavaBaseUwpFilesystemPatch -JavaHome $jre17Src -OutputJar (Join-Path $pkg "java-base-uwp-filesystem-17.jar") -WorkName "java_base_uwp_filesystem_patch_17"
+    Build-JavaZipfsRealpathPatch -JavaHome $jre17Src -OutputJar (Join-Path $pkg "java-zipfs-realpath-17.jar") -WorkName "java_zipfs_realpath_patch_17"
+    Build-JavaDesktopUwpAwtPatch -JavaHome $jre17Src -OutputJar (Join-Path $pkg "java-desktop-uwp-awt-17.jar") -WorkName "java_desktop_uwp_awt_patch_17"
+    Write-Host "Packaged Java 17 runtime for 1.18.x / 1.20.2-1.20.4 targets"
+} catch {
+    Write-Warning "Java 17 JRE not packaged: $($_.Exception.Message). Targets with javaRuntime=java17 need JDK 17 on the build machine."
+}
 Build-JavaBaseUwpFilesystemPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-base-uwp-filesystem.jar") -WorkName "java_base_uwp_filesystem_patch_current"
 Build-JavaBaseUwpFilesystemPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-base-uwp-filesystem-21.jar") -WorkName "java_base_uwp_filesystem_patch_21"
 Build-JavaZipfsRealpathPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-zipfs-realpath.jar") -WorkName "java_zipfs_realpath_patch_current"

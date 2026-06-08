@@ -40,16 +40,72 @@ Remove-Item -Recurse -Force $buildRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $classesDir | Out-Null
 New-Item -ItemType Directory -Force -Path $modsDir | Out-Null
 
+function Test-MinecraftVersionAtLeast {
+    param(
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$Minimum
+    )
+
+    $versionParts = $Version.Split('.') | ForEach-Object { [int]$_ }
+    $minimumParts = $Minimum.Split('.') | ForEach-Object { [int]$_ }
+    $count = [Math]::Max($versionParts.Length, $minimumParts.Length)
+    for ($i = 0; $i -lt $count; $i++) {
+        $value = if ($i -lt $versionParts.Length) { $versionParts[$i] } else { 0 }
+        $minimumValue = if ($i -lt $minimumParts.Length) { $minimumParts[$i] } else { 0 }
+        if ($value -gt $minimumValue) { return $true }
+        if ($value -lt $minimumValue) { return $false }
+    }
+    return $true
+}
+
+function Test-ClientJarHasClass {
+    param(
+        [Parameter(Mandatory = $true)][string]$ClientJar,
+        [Parameter(Mandatory = $true)][string]$ClassName
+    )
+
+    return [bool](& $jar tf $ClientJar | Select-String -SimpleMatch "net/minecraft/$ClassName.class" -Quiet)
+}
+
 $disabledMixins = @()
 $disabledSources = @()
-$controllerCompatVersions = @("1.16.5", "1.19.2")
+$mixinAuthorVersion = $ProjectConfig.DefaultMinecraftVersion
+$controllerCompatVersions = @("1.16.5", "1.19.2", "1.20.1")
 if ($controllerCompatVersions -notcontains $MinecraftVersion) {
     $disabledMixins += @("BanditControllerClientMixin", "BanditControllerGameRendererMixin", "BanditControllerHandledScreenMixin", "BanditControllerRecipeBookScreenMixin", "BanditControllerScreenMixin")
     $disabledSources += @("BanditControllerCompat", "BanditControllerSettings", "BanditControllerSettingsScreen")
 }
 
 $sources = Get-ChildItem $srcJava -Recurse -Filter "*.java" | Select-Object -ExpandProperty FullName
-if ($MinecraftVersion -eq $ProjectConfig.MinecraftVersion) {
+
+$controllerVariantRoots = @{
+    "1.20.1" = "1.20.1"
+}
+$controllerOverlayNames = @(
+    "BanditControllerCompat.java",
+    "BanditControllerSettingsScreen.java",
+    "BanditControllerGameRendererMixin.java",
+    "BanditControllerScreenMixin.java",
+    "BanditControllerRecipeBookScreenMixin.java"
+)
+if ($controllerCompatVersions -contains $MinecraftVersion -and $controllerVariantRoots.ContainsKey($MinecraftVersion)) {
+    $variantRoot = Join-Path $PSScriptRoot ("src\variants\" + $controllerVariantRoots[$MinecraftVersion])
+    $sources = @($sources | Where-Object { $controllerOverlayNames -notcontains (Split-Path $_ -Leaf) })
+    foreach ($name in $controllerOverlayNames) {
+        $relative = if ($name -like "*Mixin.java") {
+            Join-Path "banditvault\xboxcompat\mixin" $name
+        } else {
+            Join-Path "banditvault\xboxcompat" $name
+        }
+        $variantPath = Join-Path $variantRoot $relative
+        if (-not (Test-Path $variantPath)) {
+            throw "Missing controller variant source for ${MinecraftVersion}: $variantPath"
+        }
+        $sources += $variantPath
+    }
+}
+
+if ($MinecraftVersion -eq $mixinAuthorVersion) {
     $disabledMixins += "ZipFsBypass121Mixin"
 } else {
     $disabledMixins += @(
@@ -64,11 +120,22 @@ if ($MinecraftVersion -eq $ProjectConfig.MinecraftVersion) {
     }
 }
 
-$hasSystemDetailsClass = (& $jar tf $clientJar | Select-String -SimpleMatch "net/minecraft/class_6396.class" -Quiet)
+if (-not (Test-ClientJarHasClass -ClientJar $clientJar -ClassName "class_11653")) {
+    $disabledMixins += "WorldLoadProgressTrackerMixin"
+}
+if (-not (Test-ClientJarHasClass -ClientJar $clientJar -ClassName "class_10619")) {
+    $disabledMixins += "ZipFsBypassMixin"
+}
+if (-not (Test-ClientJarHasClass -ClientJar $clientJar -ClassName "class_7665")) {
+    $disabledMixins += "ZipFsBypass121Mixin"
+}
+
+$hasSystemDetailsClass = Test-ClientJarHasClass -ClientJar $clientJar -ClassName "class_6396"
 if (-not $hasSystemDetailsClass) {
     $disabledMixins += "SystemDetailsOshiBypassMixin"
 }
 
+$disabledMixins = @($disabledMixins | Select-Object -Unique)
 $sources = @($sources | Where-Object {
     $name = [System.IO.Path]::GetFileNameWithoutExtension($_)
     ($disabledMixins -notcontains $name) -and ($disabledSources -notcontains $name)
@@ -107,7 +174,14 @@ if ($brigadierJar) {
     Write-Warning "Brigadier jar not found in cache; controller settings screen may fail to compile."
 }
 $cp = $compileJars -join ";"
-$javaRelease = if ($MinecraftVersion -eq $ProjectConfig.MinecraftVersion) { 21 } else { 8 }
+$javaRelease = if (
+    $MinecraftVersion -eq $mixinAuthorVersion -or
+    (Test-MinecraftVersionAtLeast -Version $MinecraftVersion -Minimum "1.21")
+) {
+    $ProjectConfig.JavaRelease
+} else {
+    8
+}
 & $javac --release $javaRelease -proc:none -cp $cp -d $classesDir $sources
 if ($LASTEXITCODE -ne 0) { throw "compatibility mod compile failed" }
 
@@ -118,10 +192,14 @@ $fmj = Join-Path $classesDir "fabric.mod.json"
     Replace("__FABRIC_LOADER_VERSION__", $LoaderVersion) |
     Set-Content $fmj -NoNewline
 
-if ($disabledMixins.Count -gt 0 -or $MinecraftVersion -ne $ProjectConfig.MinecraftVersion) {
+$usesLegacyMixinCompat = (
+    $MinecraftVersion -ne $mixinAuthorVersion -and
+    -not (Test-MinecraftVersionAtLeast -Version $MinecraftVersion -Minimum "1.21")
+)
+if ($disabledMixins.Count -gt 0 -or $usesLegacyMixinCompat) {
     $mixinsPath = Join-Path $classesDir "banditvault-xbox-compat.mixins.json"
     $mixins = Get-Content -Raw -Path $mixinsPath | ConvertFrom-Json
-    if ($MinecraftVersion -ne $ProjectConfig.MinecraftVersion) {
+    if ($usesLegacyMixinCompat) {
         $mixins.compatibilityLevel = "JAVA_8"
     }
     if ($disabledMixins.Count -gt 0) {

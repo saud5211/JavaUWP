@@ -109,17 +109,93 @@ function Convert-MavenNameToPath {
     return "$group\$artifact\$versionPart\$artifact-$versionPart$classifier.jar"
 }
 
+function Get-MavenArtifactKey {
+    param([Parameter(Mandatory = $true)][string]$RelativePath)
+
+    $normalized = $RelativePath.Replace('\', '/')
+    $lastSlash = $normalized.LastIndexOf('/')
+    if ($lastSlash -le 0) {
+        return $null
+    }
+
+    $dir = $normalized.Substring(0, $lastSlash)
+    $verSlash = $dir.LastIndexOf('/')
+    if ($verSlash -le 0) {
+        return $null
+    }
+
+    return @{
+        Key = $dir.Substring(0, $verSlash)
+        Version = $dir.Substring($verSlash + 1)
+    }
+}
+
+function Compare-MavenVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Left,
+        [Parameter(Mandatory = $true)][string]$Right
+    )
+
+    $leftParts = $Left -split '[.\-_]'
+    $rightParts = $Right -split '[.\-_]'
+    $count = [Math]::Max($leftParts.Length, $rightParts.Length)
+    for ($i = 0; $i -lt $count; $i++) {
+        $l = if ($i -lt $leftParts.Length) { $leftParts[$i] } else { "0" }
+        $r = if ($i -lt $rightParts.Length) { $rightParts[$i] } else { "0" }
+
+        $lIsNum = $l -match '^\d+$'
+        $rIsNum = $r -match '^\d+$'
+        if ($lIsNum -and $rIsNum) {
+            $lNum = [int]$l
+            $rNum = [int]$r
+            if ($lNum -ne $rNum) {
+                return [Math]::Sign($lNum - $rNum)
+            }
+            continue
+        }
+
+        $cmp = [string]::Compare($l, $r, [StringComparison]::OrdinalIgnoreCase)
+        if ($cmp -ne 0) {
+            return $cmp
+        }
+    }
+
+    return 0
+}
+
 function Add-LibraryJar {
     param(
-        [System.Collections.Generic.List[string]]$Jars,
+        [hashtable]$JarEntries,
+        [System.Collections.Generic.List[string]]$JarKeyOrder,
         [Parameter(Mandatory = $true)][string]$RelativePath
     )
 
     $jarPath = Join-Path $gameDir ("libraries\" + $RelativePath.Replace('/', '\'))
-    if (Test-Path $jarPath) {
-        $Jars.Add($jarPath)
-    } else {
+    if (-not (Test-Path $jarPath)) {
         Write-Warning "Classpath library missing: $jarPath"
+        return
+    }
+
+    $maven = Get-MavenArtifactKey -RelativePath $RelativePath
+    if (-not $maven) {
+        $fallbackKey = "__path__$jarPath"
+        if (-not $JarEntries.ContainsKey($fallbackKey)) {
+            $JarKeyOrder.Add($fallbackKey) | Out-Null
+            $JarEntries[$fallbackKey] = @{ Path = $jarPath; Version = "" }
+        }
+        return
+    }
+
+    $existing = $JarEntries[$maven.Key]
+    if (-not $existing) {
+        $JarKeyOrder.Add($maven.Key) | Out-Null
+        $JarEntries[$maven.Key] = @{ Path = $jarPath; Version = $maven.Version }
+        return
+    }
+
+    if ((Compare-MavenVersion -Left $maven.Version -Right $existing.Version) -gt 0) {
+        Write-Host "Classpath: using $($maven.Key) $($maven.Version) instead of $($existing.Version)"
+        $JarEntries[$maven.Key] = @{ Path = $jarPath; Version = $maven.Version }
     }
 }
 
@@ -233,10 +309,11 @@ if (-not (Test-Path $remappedJar)) {
         throw "Client jar missing at $clientJar."
     }
 
-    $jars = [System.Collections.Generic.List[string]]::new()
+    $jarEntries = @{}
+    $jarKeyOrder = [System.Collections.Generic.List[string]]::new()
     foreach ($library in $versionJson.libraries) {
         if ($library.downloads -and $library.downloads.artifact) {
-            Add-LibraryJar -Jars $jars -RelativePath ([string]$library.downloads.artifact.path)
+            Add-LibraryJar -JarEntries $jarEntries -JarKeyOrder $jarKeyOrder -RelativePath ([string]$library.downloads.artifact.path)
         }
     }
 
@@ -246,9 +323,14 @@ if (-not (Test-Path $remappedJar)) {
     }
     $fabricVersionJson = Get-Content -Raw -Path $fabricVersionJsonPath | ConvertFrom-Json
     foreach ($library in $fabricVersionJson.libraries) {
-        Add-LibraryJar -Jars $jars -RelativePath (Convert-MavenNameToPath ([string]$library.name))
+        Add-LibraryJar -JarEntries $jarEntries -JarKeyOrder $jarKeyOrder -RelativePath (Convert-MavenNameToPath ([string]$library.name))
     }
-    $jars += $clientJar
+
+    $jars = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $jarKeyOrder) {
+        $jars.Add($jarEntries[$key].Path)
+    }
+    $jars.Add($clientJar)
     $classpath = $jars -join ";"
     $remapLog = Join-Path $notesDir "fabric-remap.log"
     $remapStdoutLog = Join-Path $notesDir "fabric-remap.stdout.log"
