@@ -26,6 +26,26 @@ You may create private forks or private modified copies for your own personal,
 educational, research, or internal purposes, provided that those copies are not
 distributed outside your control.
 
+You may publicly display, broadcast, stream, publish, upload, share, and
+monetize footage, screenshots, demonstrations, gameplay, benchmarks, reviews,
+tutorials, and videos of this project, provided that:
+
+1. The content includes clear credit to veroxsity / BanditVault and a visible
+   link back to the official project page or another official BanditVault page.
+2. The content does not redistribute, mirror, re upload, re package, sell, or
+   provide generated APPX packages, binaries, source archives, modified source
+   copies, private builds, or other project files that are not otherwise
+   permitted by this license.
+3. The content does not provide instructions, patches, scripts, configuration,
+   binaries, links, or other material intended to remove, bypass, disable,
+   weaken, stub, fake, or make optional Microsoft/Xbox authentication,
+   Minecraft ownership verification, token validation, account checks, or
+   entitlement enforcement.
+4. The content does not imply that veroxsity / BanditVault, Microsoft, Mojang,
+   Xbox, Minecraft, Fabric, Forge, NeoForge, LWJGL, Mesa, or any other third
+   party sponsors, endorses, or approves the content unless that permission has
+   been given separately.
+
 Any fork, mirror, hosted copy, backup repository, or modified source repository
 created under this license must remain private unless veroxsity / BanditVault
 has given prior written permission for public hosting. Public forks, public
@@ -54,9 +74,6 @@ You may not, without prior written permission from veroxsity / BanditVault:
    legal right to distribute.
 8. Redistribute, mirror, re upload, re package, or otherwise share nightly,
    pre release, release candidate, test, or generated APPX packages.
-9. Publicly display, broadcast, stream, publish, upload, share, or otherwise
-   distribute footage, screenshots, demonstrations, gameplay, benchmarks,
-   reviews, tutorials, or videos of this project, in whole or in part.
 
 All rights not expressly granted above are reserved by veroxsity / BanditVault.
 

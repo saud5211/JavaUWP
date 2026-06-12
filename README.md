@@ -39,7 +39,7 @@ Pre release packages are built from this repository. If you are building or test
 
 Automated **nightly** packages are published to the [nightly release](https://github.com/veroxsity/JavaUWP/releases/tag/nightly) when relevant source changes land on `main`. These are testing builds, not a final public release.
 
-**Important:** Redistribution of generated APPX packages, including nightly builds, is not permitted without prior written permission. Public install tutorials or videos for pre release packages are also not permitted until the full release. See [LICENSE](LICENSE) and [docs/LEGAL.md](docs/LEGAL.md).
+**Important:** Redistribution of generated APPX packages, including nightly builds, is not permitted without prior written permission. Videos, streams, screenshots, reviews, benchmarks, and tutorials are allowed under the creator rules in [LICENSE](LICENSE) and [docs/LEGAL.md](docs/LEGAL.md).
 
 ## First Launch
 
@@ -240,6 +240,18 @@ These are the main areas still being worked on for the pre release:
 - Some Java diagnostics may warn because the sandbox does not look like desktop Windows.
 - Legacy graphics and controller support are still being tuned.
 
+## Videos And Streaming
+
+You may make public videos, streams, screenshots, reviews, benchmarks, tutorials, and other creator content about Bandit Launcher.
+
+Creator content must:
+
+- Credit veroxsity / BanditVault and include a visible link to the official project page or another official BanditVault page.
+- Use legitimate Microsoft/Xbox sign in and Minecraft Java ownership verification.
+- Avoid sharing generated APPX packages, private builds, modified builds, source archives, mirrors, or re uploads.
+- Avoid instructions, patches, scripts, configuration, or links intended to bypass Microsoft/Xbox authentication, Minecraft ownership checks, token validation, account checks, or entitlement enforcement.
+- Avoid implying endorsement by veroxsity / BanditVault, Microsoft, Mojang, Xbox, Minecraft, Fabric, Forge, NeoForge, LWJGL, Mesa, or other third parties unless permission has been given separately.
+
 ## For Developers
 
 Detailed build, patching, architecture, and legal notes live in `docs/`.
@@ -288,7 +300,9 @@ This repo does not include Minecraft game files, signed APPX packages, or local 
 
 Original project code in this repository is available under the custom terms in [LICENSE](LICENSE). Private use is allowed with credit. Public forks, redistribution, mirrors, modified public copies, and packaged builds require prior written permission from veroxsity / BanditVault.
 
-Redistribution of generated APPX packages, including nightly and pre release packages, is not permitted without prior written permission. Public install tutorials or videos for nightly or pre release builds are not permitted until the full release.
+Videos, streams, screenshots, reviews, benchmarks, tutorials, and other creator content are allowed when they follow the attribution, redistribution, endorsement, and authentication rules in [LICENSE](LICENSE).
+
+Redistribution of generated APPX packages, including nightly and pre release packages, is not permitted without prior written permission.
 
 Removing, bypassing, disabling, stubbing, faking, or making optional Microsoft/Xbox authentication or Minecraft entitlement checks is not permitted.
 
