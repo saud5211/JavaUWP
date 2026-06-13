@@ -208,6 +208,9 @@ typedef struct { unsigned char buttons[15]; float axes[6]; } GLFWgamepadstate;
 #define GLFW_GAMEPAD_BUTTON_DPAD_RIGHT    12
 #define GLFW_GAMEPAD_BUTTON_DPAD_DOWN     13
 #define GLFW_GAMEPAD_BUTTON_DPAD_LEFT     14
+#define GLFW_MOUSE_BUTTON_LEFT            0
+#define GLFW_MOUSE_BUTTON_RIGHT           1
+#define GLFW_MOUSE_BUTTON_MIDDLE          2
 #define GLFW_GAMEPAD_AXIS_LEFT_X          0
 #define GLFW_GAMEPAD_AXIS_LEFT_Y          1
 #define GLFW_GAMEPAD_AXIS_RIGHT_X         2
