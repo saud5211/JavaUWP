@@ -1,4 +1,3 @@
-
 // glfw_uwp.cpp - GLFW WinRT/EGL shim for Minecraft Java UWP (Xbox Series S)
 // Replaces glfw.dll inside lwjgl-glfw-3.3.3-natives-windows.jar.
 
@@ -392,6 +391,12 @@ static bool g_gamepad_present = false;
 static bool g_haveGameInputGamepadState = false;
 static bool g_haveGameInputPollCache = false;
 static ULONGLONG g_lastGameInputPollMs = 0;
+
+// Mouse GameInput tracking
+static ComPtr<IGameInputReading> g_lastMouseReading;
+static GameInputMouseState g_lastMouseState = {};
+static bool g_haveLastMouseState = false;
+static int g_mouse_log_count = 0;
 static volatile LONG g_coreWindowVisibleForInput = 1;
 static volatile LONG g_coreWindowActivatedForInput = 1;
 static volatile LONGLONG g_coreWindowInputStateChangedMs = 0;
@@ -725,6 +730,8 @@ static void ClearMouseState() {
     g_scroll_x = 0.0;
     g_scroll_y = 0.0;
     g_mouse_entered = false;
+    g_haveLastMouseState = false;
+    ZeroMemory(&g_lastMouseState, sizeof(g_lastMouseState));
     if (g_cursorenter_cb) g_cursorenter_cb((GLFWwindow*)&g_fake_window, GLFW_FALSE);
 }
 
@@ -1944,40 +1951,59 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
     }
     PollGameInputGamepad(true);
 
-    // Poll GameInput for raw mouse delta
+    // Poll GameInput for mouse input using delta from previous reading
     if (EnsureGameInput()) {
         ComPtr<IGameInputReading> reading;
-        if (SUCCEEDED(g_gameInput->GetCurrentReading(GameInputKindMouse, nullptr, reading.GetAddressOf())) && reading) {
+        HRESULT hr = g_gameInput->GetCurrentReading(GameInputKindMouse, nullptr, reading.GetAddressOf());
+        if (SUCCEEDED(hr) && reading) {
             GameInputMouseState mouseState = {};
             if (reading->GetMouseState(&mouseState)) {
-                const double dx = (double)mouseState.positionX;
-                const double dy = (double)mouseState.positionY;
-                if (dx != 0.0 || dy != 0.0) {
-                    g_cursor_x += dx;
-                    g_cursor_y += dy;
-                    if (g_cursorpos_cb)
-                        g_cursorpos_cb((GLFWwindow*)&g_fake_window, g_cursor_x, g_cursor_y);
+
+                if (g_mouse_log_count < 4) {
+                    ++g_mouse_log_count;
+                    ShimLog("GameInput mouse ready buttons=0x%X x=%lld y=%lld wx=%lld wy=%lld",
+                        (unsigned)mouseState.buttons,
+                        (long long)mouseState.positionX, (long long)mouseState.positionY,
+                        (long long)mouseState.wheelX, (long long)mouseState.wheelY);
                 }
-                const bool lb = (mouseState.buttons & GameInputMouseLeftButton)   != 0;
-                const bool rb = (mouseState.buttons & GameInputMouseRightButton)  != 0;
-                const bool mb = (mouseState.buttons & GameInputMouseMiddleButton) != 0;
-                auto FireMouseBtn = [&](int btn, bool pressed) {
-                    const unsigned char next = pressed ? GLFW_PRESS : GLFW_RELEASE;
-                    if (g_mouse_button_state[btn] != next) {
-                        g_mouse_button_state[btn] = next;
-                        if (g_mousebutton_cb)
-                            g_mousebutton_cb((GLFWwindow*)&g_fake_window, btn, next, CurrentGlfwMods());
+
+                if (g_haveLastMouseState) {
+                    const INT64 dx  = mouseState.positionX - g_lastMouseState.positionX;
+                    const INT64 dy  = mouseState.positionY - g_lastMouseState.positionY;
+                    const INT64 dwx = mouseState.wheelX    - g_lastMouseState.wheelX;
+                    const INT64 dwy = mouseState.wheelY    - g_lastMouseState.wheelY;
+
+                    if (dx != 0 || dy != 0) {
+                        g_cursor_x += (double)dx;
+                        g_cursor_y += (double)dy;
+                        if (g_cursorpos_cb)
+                            g_cursorpos_cb((GLFWwindow*)&g_fake_window, g_cursor_x, g_cursor_y);
                     }
-                };
-                FireMouseBtn(GLFW_MOUSE_BUTTON_LEFT,   lb);
-                FireMouseBtn(GLFW_MOUSE_BUTTON_RIGHT,  rb);
-                FireMouseBtn(GLFW_MOUSE_BUTTON_MIDDLE, mb);
-                // Wheel
-                if (mouseState.wheelX != 0 || mouseState.wheelY != 0) {
-                    const double sx = (double)mouseState.wheelX / 120.0;
-                    const double sy = (double)mouseState.wheelY / 120.0;
-                    if (g_scroll_cb) g_scroll_cb((GLFWwindow*)&g_fake_window, sx, sy);
+
+                    if (dwx != 0 || dwy != 0) {
+                        const double sx = (double)dwx / 120.0;
+                        const double sy = (double)dwy / 120.0;
+                        if (g_scroll_cb) g_scroll_cb((GLFWwindow*)&g_fake_window, sx, sy);
+                    }
+
+                    auto FireMouseBtn = [&](int btn, GameInputMouseButtons mask) {
+                        const bool wasPressed = (g_lastMouseState.buttons & mask) != 0;
+                        const bool isPressed  = (mouseState.buttons & mask) != 0;
+                        if (wasPressed != isPressed) {
+                            g_mouse_button_state[btn] = isPressed ? GLFW_PRESS : GLFW_RELEASE;
+                            if (g_mousebutton_cb)
+                                g_mousebutton_cb((GLFWwindow*)&g_fake_window, btn,
+                                                 isPressed ? GLFW_PRESS : GLFW_RELEASE,
+                                                 CurrentGlfwMods());
+                        }
+                    };
+                    FireMouseBtn(GLFW_MOUSE_BUTTON_LEFT,   GameInputMouseLeftButton);
+                    FireMouseBtn(GLFW_MOUSE_BUTTON_RIGHT,  GameInputMouseRightButton);
+                    FireMouseBtn(GLFW_MOUSE_BUTTON_MIDDLE, GameInputMouseMiddleButton);
                 }
+
+                g_lastMouseState = mouseState;
+                g_haveLastMouseState = true;
             }
         }
     }
