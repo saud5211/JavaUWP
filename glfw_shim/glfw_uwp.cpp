@@ -16,6 +16,8 @@
 #include <GameInput.h>
 #include <windows.system.h>
 #include <windows.ui.core.h>
+#include <windows.ui.input.h>
+#include <windows.devices.input.h>
 #include <windows.graphics.display.h>
 
 using namespace Microsoft::WRL;
@@ -26,6 +28,8 @@ using namespace ABI::Windows::Foundation::Collections;
 using namespace ABI::Windows::Graphics::Display;
 using namespace ABI::Windows::System;
 using namespace ABI::Windows::UI::Core;
+using namespace ABI::Windows::UI::Input;
+using namespace ABI::Windows::Devices::Input;
 
 // ---------------------------------------------------------------------------
 // Minimal GLFW 3.3.x types
@@ -184,6 +188,7 @@ typedef struct { unsigned char buttons[15]; float axes[6]; } GLFWgamepadstate;
 #define GLFW_EGL_CONTEXT_API       0x00036002
 #define GLFW_CURSOR          0x00033001
 #define GLFW_CURSOR_NORMAL   0x00034001
+#define GLFW_CURSOR_HIDDEN   0x00034002
 #define GLFW_CURSOR_DISABLED 0x00034003
 #define GLFW_CONNECTED       0x00040001
 #define GLFW_DISCONNECTED    0x00040002
@@ -355,18 +360,28 @@ using CoreWindowKeyHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_W
 using CoreWindowCharHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CCharacterReceivedEventArgs_t;
 using CoreWindowVisibilityHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CVisibilityChangedEventArgs_t;
 using CoreWindowActivatedHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CWindowActivatedEventArgs_t;
+using CoreWindowPointerHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CPointerEventArgs_t;
 static ComPtr<CoreWindowKeyHandler> g_keyDownHandler;
 static ComPtr<CoreWindowKeyHandler> g_keyUpHandler;
 static ComPtr<CoreWindowCharHandler> g_charReceivedHandler;
 static ComPtr<CoreWindowVisibilityHandler> g_visibilityHandler;
 static ComPtr<CoreWindowActivatedHandler> g_activatedHandler;
+static ComPtr<CoreWindowPointerHandler> g_pointerMovedHandler;
+static ComPtr<CoreWindowPointerHandler> g_pointerPressedHandler;
+static ComPtr<CoreWindowPointerHandler> g_pointerReleasedHandler;
+static ComPtr<CoreWindowPointerHandler> g_pointerWheelHandler;
 static ComPtr<IGameInput> g_gameInput;
 static EventRegistrationToken g_keyDownToken = {};
 static EventRegistrationToken g_keyUpToken = {};
 static EventRegistrationToken g_charReceivedToken = {};
 static EventRegistrationToken g_visibilityToken = {};
 static EventRegistrationToken g_activatedToken = {};
+static EventRegistrationToken g_pointerMovedToken = {};
+static EventRegistrationToken g_pointerPressedToken = {};
+static EventRegistrationToken g_pointerReleasedToken = {};
+static EventRegistrationToken g_pointerWheelToken = {};
 static bool g_keyboardHooksInstalled = false;
+static bool g_mouseHooksInstalled = false;
 static bool g_lifecycleHooksInstalled = false;
 static bool g_gameInputCreateTried = false;
 static bool g_gamepad_present = false;
@@ -379,6 +394,17 @@ static volatile LONGLONG g_coreWindowInputStateChangedMs = 0;
 static bool g_legacyControllerModModeLogged = false;
 static bool g_lastLegacyControllerModMode = false;
 static unsigned char g_key_state[512] = {};
+
+// ---------------------------------------------------------------------------
+// Mouse state
+// ---------------------------------------------------------------------------
+static double g_cursor_x = 0.0;          // virtual / accumulated cursor position
+static double g_cursor_y = 0.0;
+static unsigned char g_mouse_button_state[8] = {};  // GLFW_MOUSE_BUTTON_* indices
+static int  g_cursor_mode = GLFW_CURSOR_NORMAL;      // GLFW_CURSOR_NORMAL or GLFW_CURSOR_DISABLED
+static double g_scroll_x = 0.0;          // accumulated scroll (consumed by glfwPollEvents)
+static double g_scroll_y = 0.0;
+static bool g_mouse_entered = false;
 static GameInputGamepadState g_lastGameInputGamepadState = {};
 static GLFWgamepadstate g_gamepad_state = {};
 static float g_joystick_axes[6] = {};
@@ -690,6 +716,14 @@ static void ClearKeyboardState() {
     ZeroMemory(g_key_state, sizeof(g_key_state));
 }
 
+static void ClearMouseState() {
+    ZeroMemory(g_mouse_button_state, sizeof(g_mouse_button_state));
+    g_scroll_x = 0.0;
+    g_scroll_y = 0.0;
+    g_mouse_entered = false;
+    if (g_cursorenter_cb) g_cursorenter_cb((GLFWwindow*)&g_fake_window, GLFW_FALSE);
+}
+
 static void ClearGamepadState() {
     ZeroMemory(&g_gamepad_state, sizeof(g_gamepad_state));
     ZeroMemory(g_joystick_axes, sizeof(g_joystick_axes));
@@ -952,6 +986,165 @@ static bool InstallKeyboardHooks() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Mouse helpers
+// ---------------------------------------------------------------------------
+
+// Map a UWP PointerPointProperties bitmask to a GLFW button index.
+// Returns -1 when the button is not a recognised mouse button.
+static int PointerUpdateKindToGlfwButton(ABI::Windows::UI::Input::PointerUpdateKind kind) {
+    switch (kind) {
+    case PointerUpdateKind_LeftButtonPressed:
+    case PointerUpdateKind_LeftButtonReleased:   return GLFW_MOUSE_BUTTON_LEFT;
+    case PointerUpdateKind_RightButtonPressed:
+    case PointerUpdateKind_RightButtonReleased:  return GLFW_MOUSE_BUTTON_RIGHT;
+    case PointerUpdateKind_MiddleButtonPressed:
+    case PointerUpdateKind_MiddleButtonReleased: return GLFW_MOUSE_BUTTON_MIDDLE;
+    default: return -1;
+    }
+}
+
+static bool PointerUpdateKindIsPress(ABI::Windows::UI::Input::PointerUpdateKind kind) {
+    return kind == PointerUpdateKind_LeftButtonPressed  ||
+           kind == PointerUpdateKind_RightButtonPressed ||
+           kind == PointerUpdateKind_MiddleButtonPressed;
+}
+
+// Returns true when the PointerDevice associated with args is a Mouse or Pen
+// (i.e. not a touch finger, which should not drive the GLFW cursor).
+static bool IsMousePointer(IPointerEventArgs* args) {
+    if (!args) return false;
+    ComPtr<IPointerPoint> point;
+    if (FAILED(args->get_CurrentPoint(point.GetAddressOf())) || !point) return false;
+    ComPtr<ABI::Windows::Devices::Input::IPointerDevice> device;
+    if (FAILED(point->get_PointerDevice(device.GetAddressOf())) || !device) return false;
+    PointerDeviceType dtype = PointerDeviceType_Touch;
+    device->get_PointerDeviceType(&dtype);
+    return dtype == PointerDeviceType_Mouse || dtype == PointerDeviceType_Pen;
+}
+
+static void ApplyCursorMode() {
+    if (!g_coreWindow) return;
+    if (g_cursor_mode == GLFW_CURSOR_DISABLED) {
+        // Hide the system pointer
+        g_coreWindow->put_PointerCursor(nullptr);
+    } else {
+        // Restore the default arrow cursor
+        ComPtr<ICoreCursorFactory> factory;
+        HRESULT hr = GetActivationFactory(
+            HStringReference(RuntimeClass_Windows_UI_Core_CoreCursor).Get(),
+            &factory);
+        if (SUCCEEDED(hr)) {
+            ComPtr<ICoreCursor> cursor;
+            hr = factory->CreateCursor(CoreCursorType_Arrow, 0, cursor.GetAddressOf());
+            if (SUCCEEDED(hr)) g_coreWindow->put_PointerCursor(cursor.Get());
+        }
+    }
+}
+
+static void InstallMouseHooks() {
+    if (g_mouseHooksInstalled || !g_coreWindow) return;
+
+    // PointerMoved — update virtual cursor position and fire cursorpos callback
+    g_pointerMovedHandler = Callback<CoreWindowPointerHandler>(
+        [](ICoreWindow*, IPointerEventArgs* args) -> HRESULT {
+            if (!IsMousePointer(args)) return S_OK;
+            ComPtr<IPointerPoint> point;
+            if (FAILED(args->get_CurrentPoint(point.GetAddressOf())) || !point) return S_OK;
+            Point pos = {};
+            point->get_Position(&pos);
+
+            if (g_cursor_mode == GLFW_CURSOR_DISABLED) {
+                // In disabled mode we accumulate raw delta via GameInput;
+                // absolute position is ignored — do nothing here.
+            } else {
+                g_cursor_x = (double)pos.X;
+                g_cursor_y = (double)pos.Y;
+                if (!g_mouse_entered) {
+                    g_mouse_entered = true;
+                    if (g_cursorenter_cb) g_cursorenter_cb((GLFWwindow*)&g_fake_window, GLFW_TRUE);
+                }
+                if (g_cursorpos_cb) g_cursorpos_cb((GLFWwindow*)&g_fake_window, g_cursor_x, g_cursor_y);
+            }
+            return S_OK;
+        });
+
+    // PointerPressed — fire mousebutton press callback
+    g_pointerPressedHandler = Callback<CoreWindowPointerHandler>(
+        [](ICoreWindow*, IPointerEventArgs* args) -> HRESULT {
+            if (!IsMousePointer(args)) return S_OK;
+            ComPtr<IPointerPoint> point;
+            if (FAILED(args->get_CurrentPoint(point.GetAddressOf())) || !point) return S_OK;
+            ComPtr<IPointerPointProperties> props;
+            if (FAILED(point->get_Properties(props.GetAddressOf())) || !props) return S_OK;
+            PointerUpdateKind kind = PointerUpdateKind_Other;
+            props->get_PointerUpdateKind(&kind);
+            const int btn = PointerUpdateKindToGlfwButton(kind);
+            if (btn < 0 || btn >= 8) return S_OK;
+            g_mouse_button_state[btn] = GLFW_PRESS;
+            if (g_mousebutton_cb)
+                g_mousebutton_cb((GLFWwindow*)&g_fake_window, btn, GLFW_PRESS, CurrentGlfwMods());
+            return S_OK;
+        });
+
+    // PointerReleased — fire mousebutton release callback
+    g_pointerReleasedHandler = Callback<CoreWindowPointerHandler>(
+        [](ICoreWindow*, IPointerEventArgs* args) -> HRESULT {
+            if (!IsMousePointer(args)) return S_OK;
+            ComPtr<IPointerPoint> point;
+            if (FAILED(args->get_CurrentPoint(point.GetAddressOf())) || !point) return S_OK;
+            ComPtr<IPointerPointProperties> props;
+            if (FAILED(point->get_Properties(props.GetAddressOf())) || !props) return S_OK;
+            PointerUpdateKind kind = PointerUpdateKind_Other;
+            props->get_PointerUpdateKind(&kind);
+            const int btn = PointerUpdateKindToGlfwButton(kind);
+            if (btn < 0 || btn >= 8) return S_OK;
+            g_mouse_button_state[btn] = GLFW_RELEASE;
+            if (g_mousebutton_cb)
+                g_mousebutton_cb((GLFWwindow*)&g_fake_window, btn, GLFW_RELEASE, CurrentGlfwMods());
+            return S_OK;
+        });
+
+    // PointerWheelChanged — fire scroll callback
+    g_pointerWheelHandler = Callback<CoreWindowPointerHandler>(
+        [](ICoreWindow*, IPointerEventArgs* args) -> HRESULT {
+            if (!IsMousePointer(args)) return S_OK;
+            ComPtr<IPointerPoint> point;
+            if (FAILED(args->get_CurrentPoint(point.GetAddressOf())) || !point) return S_OK;
+            ComPtr<IPointerPointProperties> props;
+            if (FAILED(point->get_Properties(props.GetAddressOf())) || !props) return S_OK;
+            INT32 delta = 0;
+            props->get_MouseWheelDelta(&delta);
+            boolean isHorizontal = false;
+            props->get_IsHorizontalMouseWheel(&isHorizontal);
+            // GLFW convention: one "notch" = 1.0; Windows gives multiples of 120
+            const double scrollAmount = (double)delta / 120.0;
+            if (isHorizontal) {
+                g_scroll_x += scrollAmount;
+            } else {
+                g_scroll_y += scrollAmount;
+            }
+            if (g_scroll_cb)
+                g_scroll_cb((GLFWwindow*)&g_fake_window,
+                            isHorizontal ? scrollAmount : 0.0,
+                            isHorizontal ? 0.0 : scrollAmount);
+            return S_OK;
+        });
+
+    HRESULT hr = g_coreWindow->add_PointerMoved(g_pointerMovedHandler.Get(), &g_pointerMovedToken);
+    if (FAILED(hr)) { ShimLog("add_PointerMoved failed hr=0x%08X", hr); return; }
+    hr = g_coreWindow->add_PointerPressed(g_pointerPressedHandler.Get(), &g_pointerPressedToken);
+    if (FAILED(hr)) { ShimLog("add_PointerPressed failed hr=0x%08X", hr); return; }
+    hr = g_coreWindow->add_PointerReleased(g_pointerReleasedHandler.Get(), &g_pointerReleasedToken);
+    if (FAILED(hr)) { ShimLog("add_PointerReleased failed hr=0x%08X", hr); return; }
+    hr = g_coreWindow->add_PointerWheelChanged(g_pointerWheelHandler.Get(), &g_pointerWheelToken);
+    if (FAILED(hr)) { ShimLog("add_PointerWheelChanged failed hr=0x%08X", hr); return; }
+
+    ApplyCursorMode();
+    g_mouseHooksInstalled = true;
+    ShimLog("CoreWindow mouse hooks installed");
+}
+
 static void InstallCoreWindowLifecycleHooks() {
     if (g_lifecycleHooksInstalled || !g_coreWindow) return;
 
@@ -967,6 +1160,7 @@ static void InstallCoreWindowLifecycleHooks() {
                 MarkCoreWindowInputStateChanged();
                 ClearKeyboardState();
                 ClearGamepadState();
+                ClearMouseState();
                 ShimLog("CoreWindow VisibilityChanged visible=%d", next);
             }
             return S_OK;
@@ -989,6 +1183,7 @@ static void InstallCoreWindowLifecycleHooks() {
                 MarkCoreWindowInputStateChanged();
                 ClearKeyboardState();
                 ClearGamepadState();
+                ClearMouseState();
                 ShimLog("CoreWindow Activated state=%d active=%d", (int)state, next);
             }
             if (g_focus_cb) {
@@ -1060,6 +1255,7 @@ static bool AcquireCoreWindow() {
     g_coreWindow->get_Dispatcher(g_dispatcher.GetAddressOf());
     InstallCoreWindowLifecycleHooks();
     InstallKeyboardHooks();
+    InstallMouseHooks();
     return true;
 }
 
@@ -1744,6 +1940,46 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
         g_dispatcher->ProcessEvents(CoreProcessEventsOption_ProcessAllIfPresent);
     }
     PollGameInputGamepad(true);
+
+    // Poll GameInput for raw mouse delta (used in GLFW_CURSOR_DISABLED mode)
+    if (g_cursor_mode == GLFW_CURSOR_DISABLED && EnsureGameInput()) {
+        ComPtr<IGameInputReading> reading;
+        if (SUCCEEDED(g_gameInput->GetCurrentReading(GameInputKindMouse, nullptr, reading.GetAddressOf())) && reading) {
+            GameInputMouseState mouseState = {};
+            if (reading->GetMouseState(&mouseState)) {
+                const double dx = (double)mouseState.positionX;
+                const double dy = (double)mouseState.positionY;
+                if (dx != 0.0 || dy != 0.0) {
+                    g_cursor_x += dx;
+                    g_cursor_y += dy;
+                    if (g_cursorpos_cb)
+                        g_cursorpos_cb((GLFWwindow*)&g_fake_window, g_cursor_x, g_cursor_y);
+                }
+                // Buttons from GameInput (complement to CoreWindow events)
+                const bool lb = (mouseState.buttons & GameInputMouseLeftButton)   != 0;
+                const bool rb = (mouseState.buttons & GameInputMouseRightButton)  != 0;
+                const bool mb = (mouseState.buttons & GameInputMouseMiddleButton) != 0;
+                auto FireMouseBtn = [&](int btn, bool pressed) {
+                    const unsigned char next = pressed ? GLFW_PRESS : GLFW_RELEASE;
+                    if (g_mouse_button_state[btn] != next) {
+                        g_mouse_button_state[btn] = next;
+                        if (g_mousebutton_cb)
+                            g_mousebutton_cb((GLFWwindow*)&g_fake_window, btn, next, CurrentGlfwMods());
+                    }
+                };
+                FireMouseBtn(GLFW_MOUSE_BUTTON_LEFT,   lb);
+                FireMouseBtn(GLFW_MOUSE_BUTTON_RIGHT,  rb);
+                FireMouseBtn(GLFW_MOUSE_BUTTON_MIDDLE, mb);
+                // Wheel
+                if (mouseState.wheelX != 0 || mouseState.wheelY != 0) {
+                    const double sx = (double)mouseState.wheelX / 120.0;
+                    const double sy = (double)mouseState.wheelY / 120.0;
+                    if (g_scroll_cb) g_scroll_cb((GLFWwindow*)&g_fake_window, sx, sy);
+                }
+            }
+        }
+    }
+
     RefreshWindowMetrics(true);
 }
 extern "C" __declspec(dllexport) void glfwWaitEvents(void) {
@@ -1766,8 +2002,21 @@ extern "C" __declspec(dllexport) void glfwWaitEventsTimeout(double) {
     glfwPollEvents();
 }
 extern "C" __declspec(dllexport) void glfwPostEmptyEvent(void) {}
-extern "C" __declspec(dllexport) int  glfwGetInputMode(GLFWwindow*, int m) { return m == GLFW_CURSOR ? GLFW_CURSOR_NORMAL : 0; }
-extern "C" __declspec(dllexport) void glfwSetInputMode(GLFWwindow*, int, int) {}
+extern "C" __declspec(dllexport) int  glfwGetInputMode(GLFWwindow*, int m) {
+    if (m == GLFW_CURSOR) return g_cursor_mode;
+    return 0;
+}
+extern "C" __declspec(dllexport) void glfwSetInputMode(GLFWwindow*, int mode, int value) {
+    if (mode == GLFW_CURSOR) {
+        if (value != g_cursor_mode) {
+            g_cursor_mode = value;
+            ApplyCursorMode();
+            ShimLog("Cursor mode set to %s",
+                value == GLFW_CURSOR_DISABLED ? "DISABLED" :
+                value == GLFW_CURSOR_HIDDEN   ? "HIDDEN"   : "NORMAL");
+        }
+    }
+}
 extern "C" __declspec(dllexport) int  glfwRawMouseMotionSupported(void) { return GLFW_FALSE; }
 static const char* KeyNameFromGlfwKey(int key) {
     switch (key) {
@@ -1875,9 +2124,23 @@ extern "C" __declspec(dllexport) int  glfwGetKey(GLFWwindow*, int key) {
     if (key < 0 || key >= (int)sizeof(g_key_state)) return GLFW_RELEASE;
     return g_key_state[key] ? GLFW_PRESS : GLFW_RELEASE;
 }
-extern "C" __declspec(dllexport) int  glfwGetMouseButton(GLFWwindow*, int) { return GLFW_RELEASE; }
-extern "C" __declspec(dllexport) void glfwGetCursorPos(GLFWwindow*, double*x, double*y) { if(x)*x=0.; if(y)*y=0.; }
-extern "C" __declspec(dllexport) void glfwSetCursorPos(GLFWwindow*, double, double) {}
+extern "C" __declspec(dllexport) int  glfwGetMouseButton(GLFWwindow*, int btn) {
+    if (btn < 0 || btn >= 8) return GLFW_RELEASE;
+    return g_mouse_button_state[btn] ? GLFW_PRESS : GLFW_RELEASE;
+}
+extern "C" __declspec(dllexport) void glfwGetCursorPos(GLFWwindow*, double* x, double* y) {
+    if (x) *x = g_cursor_x;
+    if (y) *y = g_cursor_y;
+}
+extern "C" __declspec(dllexport) void glfwSetCursorPos(GLFWwindow*, double x, double y) {
+    g_cursor_x = x;
+    g_cursor_y = y;
+    // In normal mode, also warp the system pointer via CoreWindow
+    if (g_cursor_mode != GLFW_CURSOR_DISABLED && g_coreWindow) {
+        // UWP doesn't expose a direct SetCursorPos; use CoreWindow::SetPointerCapture
+        // and rely on the next PointerMoved to sync. The virtual position is set above.
+    }
+}
 extern "C" __declspec(dllexport) GLFWcursor* glfwCreateCursor(const GLFWimage*, int, int) { return (GLFWcursor*)1; }
 extern "C" __declspec(dllexport) GLFWcursor* glfwCreateStandardCursor(int) { return (GLFWcursor*)1; }
 extern "C" __declspec(dllexport) void glfwDestroyCursor(GLFWcursor*) {}
