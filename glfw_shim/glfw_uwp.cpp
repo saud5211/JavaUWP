@@ -1,3 +1,4 @@
+
 // glfw_uwp.cpp - GLFW WinRT/EGL shim for Minecraft Java UWP (Xbox Series S)
 // Replaces glfw.dll inside lwjgl-glfw-3.3.3-natives-windows.jar.
 
@@ -1020,9 +1021,9 @@ static bool IsMousePointer(IPointerEventArgs* args) {
     ComPtr<IPointerPoint> point;
     if (FAILED(args->get_CurrentPoint(point.GetAddressOf())) || !point) return false;
     ComPtr<ABI::Windows::Devices::Input::IPointerDevice> device;
-    if (FAILED(point->get_PointerDevice(device.GetAddressOf())) || !device) return false;
+    if (FAILED(point->get_PointerDevice(device.GetAddressOf())) || !device) return true; // fail open
     PointerDeviceType dtype = PointerDeviceType_Touch;
-    device->get_PointerDeviceType(&dtype);
+    if (FAILED(device->get_PointerDeviceType(&dtype))) return true; // fail open
     return dtype == PointerDeviceType_Mouse || dtype == PointerDeviceType_Pen;
 }
 
@@ -1058,8 +1059,7 @@ static void InstallMouseHooks() {
             point->get_Position(&pos);
 
             if (g_cursor_mode == GLFW_CURSOR_DISABLED) {
-                // In disabled mode we accumulate raw delta via GameInput;
-                // absolute position is ignored — do nothing here.
+                // In disabled mode GameInput handles delta accumulation in PollEvents.
             } else {
                 g_cursor_x = (double)pos.X;
                 g_cursor_y = (double)pos.Y;
@@ -1944,8 +1944,8 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
     }
     PollGameInputGamepad(true);
 
-    // Poll GameInput for raw mouse delta (used in GLFW_CURSOR_DISABLED mode)
-    if (g_cursor_mode == GLFW_CURSOR_DISABLED && EnsureGameInput()) {
+    // Poll GameInput for raw mouse delta
+    if (EnsureGameInput()) {
         ComPtr<IGameInputReading> reading;
         if (SUCCEEDED(g_gameInput->GetCurrentReading(GameInputKindMouse, nullptr, reading.GetAddressOf())) && reading) {
             GameInputMouseState mouseState = {};
@@ -1958,7 +1958,6 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
                     if (g_cursorpos_cb)
                         g_cursorpos_cb((GLFWwindow*)&g_fake_window, g_cursor_x, g_cursor_y);
                 }
-                // Buttons from GameInput (complement to CoreWindow events)
                 const bool lb = (mouseState.buttons & GameInputMouseLeftButton)   != 0;
                 const bool rb = (mouseState.buttons & GameInputMouseRightButton)  != 0;
                 const bool mb = (mouseState.buttons & GameInputMouseMiddleButton) != 0;
