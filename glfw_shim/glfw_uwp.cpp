@@ -402,6 +402,10 @@ static int g_mouse_log_count = 0;
 static float g_mouse_stick_dx = 0.0f;
 static float g_mouse_stick_dy = 0.0f;
 static int   g_mouse_scroll_pending = 0;
+
+// Mouse GameInput device
+static ComPtr<IGameInputDevice> g_mouseDevice;
+static GameInputCallbackToken   g_mouseDeviceToken = GAMEINPUT_INVALID_CALLBACK_TOKEN_VALUE;
 static volatile LONG g_coreWindowVisibleForInput = 1;
 static volatile LONG g_coreWindowActivatedForInput = 1;
 static volatile LONGLONG g_coreWindowInputStateChangedMs = 0;
@@ -741,6 +745,7 @@ static void ClearMouseState() {
     g_mouse_scroll_pending = 0;
     ZeroMemory(&g_lastMouseState, sizeof(g_lastMouseState));
     if (g_cursorenter_cb) g_cursorenter_cb((GLFWwindow*)&g_fake_window, GLFW_FALSE);
+    // Note: don't release g_mouseDevice here — device stays connected across focus changes
 }
 
 static void ClearGamepadState() {
@@ -946,11 +951,27 @@ static bool PollGameInputGamepad(bool fireCallbacks) {
     g_gamepad_present = present;
 
     if (!present) {
-        ClearGamepadState();
         g_haveGameInputGamepadState = false;
 
-        if (previousPresent && fireCallbacks && g_joystick_cb) {
-            g_joystick_cb(GLFW_JOYSTICK_1, GLFW_DISCONNECTED);
+        // If mouse has pending input, synthesize a virtual gamepad from it
+        if (g_haveLastMouseState && (g_mouse_stick_dx != 0.0f || g_mouse_stick_dy != 0.0f ||
+            g_mouse_scroll_pending != 0 || g_lastMouseState.buttons != 0)) {
+            if (!g_gamepad_present) {
+                g_gamepad_present = true;
+                if (fireCallbacks && g_joystick_cb)
+                    g_joystick_cb(GLFW_JOYSTICK_1, GLFW_CONNECTED);
+                ShimLog("Virtual gamepad connected (mouse-only mode)");
+            }
+            GameInputGamepadState emptyState = {};
+            ConvertGameInputGamepadState(emptyState);
+            return true;
+        }
+
+        if (g_gamepad_present) {
+            g_gamepad_present = false;
+            ClearGamepadState();
+            if (previousPresent && fireCallbacks && g_joystick_cb)
+                g_joystick_cb(GLFW_JOYSTICK_1, GLFW_DISCONNECTED);
         }
         if (g_controller_log_count < 6) {
             ++g_controller_log_count;
@@ -2008,8 +2029,27 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
 
     // Poll GameInput for mouse input using delta from previous reading
     if (EnsureGameInput()) {
+        // Try to get mouse device if we don't have one yet
+        if (!g_mouseDevice) {
+            g_gameInput->RegisterDeviceCallback(
+                nullptr,
+                GameInputKindMouse,
+                GameInputDeviceConnected,
+                GameInputBlockingEnumeration,
+                nullptr,
+                [](GameInputCallbackToken, void*, IGameInputDevice* device,
+                   uint64_t, GameInputDeviceStatus, GameInputDeviceStatus) {
+                    if (!g_mouseDevice) {
+                        g_mouseDevice = device;
+                        g_mouseDevice->AddRef();
+                        ShimLog("GameInput mouse device found");
+                    }
+                },
+                &g_mouseDeviceToken);
+        }
+
         ComPtr<IGameInputReading> reading;
-        HRESULT hr = g_gameInput->GetCurrentReading(GameInputKindMouse, nullptr, reading.GetAddressOf());
+        HRESULT hr = g_gameInput->GetCurrentReading(GameInputKindMouse, g_mouseDevice.Get(), reading.GetAddressOf());
         if (SUCCEEDED(hr) && reading) {
             GameInputMouseState mouseState = {};
             if (reading->GetMouseState(&mouseState)) {
@@ -2027,11 +2067,9 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
                     const INT64 dy  = mouseState.positionY - g_lastMouseState.positionY;
                     const INT64 dwy = mouseState.wheelY    - g_lastMouseState.wheelY;
 
-                    // Accumulate into right stick delta for injection in ConvertGameInputGamepadState
                     g_mouse_stick_dx += (float)dx;
                     g_mouse_stick_dy += (float)dy;
 
-                    // Scroll: accumulate direction (one notch = 120)
                     if (dwy > 0)       g_mouse_scroll_pending += 1;
                     else if (dwy < 0)  g_mouse_scroll_pending -= 1;
                 }
@@ -2039,6 +2077,9 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
                 g_lastMouseState = mouseState;
                 g_haveLastMouseState = true;
             }
+        } else if (g_mouse_log_count < 4) {
+            ++g_mouse_log_count;
+            ShimLog("GameInput mouse read failed hr=0x%08X", hr);
         }
     }
 
