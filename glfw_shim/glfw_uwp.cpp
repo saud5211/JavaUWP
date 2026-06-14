@@ -397,6 +397,11 @@ static ComPtr<IGameInputReading> g_lastMouseReading;
 static GameInputMouseState g_lastMouseState = {};
 static bool g_haveLastMouseState = false;
 static int g_mouse_log_count = 0;
+
+// Pending mouse delta to inject into gamepad right stick next poll
+static float g_mouse_stick_dx = 0.0f;
+static float g_mouse_stick_dy = 0.0f;
+static int   g_mouse_scroll_pending = 0;
 static volatile LONG g_coreWindowVisibleForInput = 1;
 static volatile LONG g_coreWindowActivatedForInput = 1;
 static volatile LONGLONG g_coreWindowInputStateChangedMs = 0;
@@ -731,6 +736,9 @@ static void ClearMouseState() {
     g_scroll_y = 0.0;
     g_mouse_entered = false;
     g_haveLastMouseState = false;
+    g_mouse_stick_dx = 0.0f;
+    g_mouse_stick_dy = 0.0f;
+    g_mouse_scroll_pending = 0;
     ZeroMemory(&g_lastMouseState, sizeof(g_lastMouseState));
     if (g_cursorenter_cb) g_cursorenter_cb((GLFWwindow*)&g_fake_window, GLFW_FALSE);
 }
@@ -844,26 +852,73 @@ static void ConvertGameInputGamepadState(const GameInputGamepadState& state) {
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_B] = GamepadButton(state.buttons, GameInputGamepadB);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_X] = GamepadButton(state.buttons, GameInputGamepadX);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_Y] = GamepadButton(state.buttons, GameInputGamepadY);
-    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_LEFT_BUMPER] = GamepadButton(state.buttons, GameInputGamepadLeftShoulder);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_LEFT_BUMPER]  = GamepadButton(state.buttons, GameInputGamepadLeftShoulder);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER] = GamepadButton(state.buttons, GameInputGamepadRightShoulder);
-    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_BACK] = GamepadButton(state.buttons, GameInputGamepadView);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_BACK]  = GamepadButton(state.buttons, GameInputGamepadView);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_START] = GamepadButton(state.buttons, GameInputGamepadMenu);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_GUIDE] = GLFW_RELEASE;
-    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_LEFT_THUMB] = GamepadButton(state.buttons, GameInputGamepadLeftThumbstick);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_LEFT_THUMB]  = GamepadButton(state.buttons, GameInputGamepadLeftThumbstick);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_THUMB] = GamepadButton(state.buttons, GameInputGamepadRightThumbstick);
-    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_UP] = GamepadButton(state.buttons, GameInputGamepadDPadUp);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_UP]    = GamepadButton(state.buttons, GameInputGamepadDPadUp);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_RIGHT] = GamepadButton(state.buttons, GameInputGamepadDPadRight);
-    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_DOWN] = GamepadButton(state.buttons, GameInputGamepadDPadDown);
-    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_LEFT] = GamepadButton(state.buttons, GameInputGamepadDPadLeft);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_DOWN]  = GamepadButton(state.buttons, GameInputGamepadDPadDown);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_LEFT]  = GamepadButton(state.buttons, GameInputGamepadDPadLeft);
 
-    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_X] = ShapeStickAxisForLegacyControllerMods(state.leftThumbstickX);
-    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] = ShapeStickAxisForLegacyControllerMods(-state.leftThumbstickY);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_X]  = ShapeStickAxisForLegacyControllerMods(state.leftThumbstickX);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y]  = ShapeStickAxisForLegacyControllerMods(-state.leftThumbstickY);
     g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_X] = ShapeStickAxisForLegacyControllerMods(state.rightThumbstickX);
     g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y] = ShapeStickAxisForLegacyControllerMods(-state.rightThumbstickY);
-    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] = ClampGamepadAxis(state.leftTrigger * 2.0f - 1.0f);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER]  = ClampGamepadAxis(state.leftTrigger  * 2.0f - 1.0f);
     g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] = ClampGamepadAxis(state.rightTrigger * 2.0f - 1.0f);
 
-    memcpy(g_joystick_axes, g_gamepad_state.axes, sizeof(g_joystick_axes));
+    // ---------------------------------------------------------------------------
+    // Inject mouse input into gamepad state
+    // Mouse movement  -> right stick (camera look)
+    // Left click      -> A button (attack)
+    // Right click     -> left trigger (use item)
+    // Middle click    -> right stick click
+    // Scroll up/down  -> D-pad up/down (hotbar)
+    // ---------------------------------------------------------------------------
+    if (g_haveLastMouseState) {
+        // Sensitivity: pixels per frame -> [-1, 1] stick range
+        // 20px of movement = full stick deflection (tune as needed)
+        const float MOUSE_SENSITIVITY = 1.0f / 20.0f;
+
+        // We store pending mouse delta accumulated since last gamepad poll
+        if (g_mouse_stick_dx != 0.0f || g_mouse_stick_dy != 0.0f) {
+            float rx = ClampGamepadAxis(g_mouse_stick_dx * MOUSE_SENSITIVITY);
+            float ry = ClampGamepadAxis(g_mouse_stick_dy * MOUSE_SENSITIVITY);
+
+            // Only override right stick if mouse has moved (don't clobber physical stick)
+            if (rx != 0.0f || ry != 0.0f) {
+                g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_X] = rx;
+                g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y] = ry;
+            }
+            g_mouse_stick_dx = 0.0f;
+            g_mouse_stick_dy = 0.0f;
+        }
+
+        // Left click -> A button (attack/break)
+        if (g_lastMouseState.buttons & GameInputMouseLeftButton)
+            g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_A] = GLFW_PRESS;
+
+        // Right click -> left trigger (use/place)
+        if (g_lastMouseState.buttons & GameInputMouseRightButton)
+            g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] = 1.0f;
+
+        // Middle click -> right stick click (e.g. pick block)
+        if (g_lastMouseState.buttons & GameInputMouseMiddleButton)
+            g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_THUMB] = GLFW_PRESS;
+
+        // Scroll wheel -> D-pad up/down (hotbar slot)
+        if (g_mouse_scroll_pending > 0)
+            g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_UP] = GLFW_PRESS;
+        else if (g_mouse_scroll_pending < 0)
+            g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_DOWN] = GLFW_PRESS;
+        g_mouse_scroll_pending = 0;
+    }
+
+    memcpy(g_joystick_axes,    g_gamepad_state.axes,    sizeof(g_joystick_axes));
     memcpy(g_joystick_buttons, g_gamepad_state.buttons, sizeof(g_joystick_buttons));
 }
 
@@ -1970,36 +2025,15 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
                 if (g_haveLastMouseState) {
                     const INT64 dx  = mouseState.positionX - g_lastMouseState.positionX;
                     const INT64 dy  = mouseState.positionY - g_lastMouseState.positionY;
-                    const INT64 dwx = mouseState.wheelX    - g_lastMouseState.wheelX;
                     const INT64 dwy = mouseState.wheelY    - g_lastMouseState.wheelY;
 
-                    if (dx != 0 || dy != 0) {
-                        g_cursor_x += (double)dx;
-                        g_cursor_y += (double)dy;
-                        if (g_cursorpos_cb)
-                            g_cursorpos_cb((GLFWwindow*)&g_fake_window, g_cursor_x, g_cursor_y);
-                    }
+                    // Accumulate into right stick delta for injection in ConvertGameInputGamepadState
+                    g_mouse_stick_dx += (float)dx;
+                    g_mouse_stick_dy += (float)dy;
 
-                    if (dwx != 0 || dwy != 0) {
-                        const double sx = (double)dwx / 120.0;
-                        const double sy = (double)dwy / 120.0;
-                        if (g_scroll_cb) g_scroll_cb((GLFWwindow*)&g_fake_window, sx, sy);
-                    }
-
-                    auto FireMouseBtn = [&](int btn, GameInputMouseButtons mask) {
-                        const bool wasPressed = (g_lastMouseState.buttons & mask) != 0;
-                        const bool isPressed  = (mouseState.buttons & mask) != 0;
-                        if (wasPressed != isPressed) {
-                            g_mouse_button_state[btn] = isPressed ? GLFW_PRESS : GLFW_RELEASE;
-                            if (g_mousebutton_cb)
-                                g_mousebutton_cb((GLFWwindow*)&g_fake_window, btn,
-                                                 isPressed ? GLFW_PRESS : GLFW_RELEASE,
-                                                 CurrentGlfwMods());
-                        }
-                    };
-                    FireMouseBtn(GLFW_MOUSE_BUTTON_LEFT,   GameInputMouseLeftButton);
-                    FireMouseBtn(GLFW_MOUSE_BUTTON_RIGHT,  GameInputMouseRightButton);
-                    FireMouseBtn(GLFW_MOUSE_BUTTON_MIDDLE, GameInputMouseMiddleButton);
+                    // Scroll: accumulate direction (one notch = 120)
+                    if (dwy > 0)       g_mouse_scroll_pending += 1;
+                    else if (dwy < 0)  g_mouse_scroll_pending -= 1;
                 }
 
                 g_lastMouseState = mouseState;
